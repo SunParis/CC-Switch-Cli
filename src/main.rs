@@ -3,6 +3,7 @@ mod dbus;
 mod direct;
 mod error;
 mod process;
+mod schema;
 mod state;
 
 use clap::Parser;
@@ -102,7 +103,7 @@ fn switch_provider(
                 "CC Switch started while preparing the direct switch; retry the command".into(),
             ));
         }
-        ("direct", direct::switch(&provider.id)?, None)
+        ("direct", direct::switch(reader, &provider.id)?, None)
     };
 
     wait_for_convergence(reader, tray.as_ref(), &providers, &provider.id)?;

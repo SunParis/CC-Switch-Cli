@@ -1,10 +1,9 @@
 use crate::error::AppError;
+use crate::schema::{read_schema_number, SchemaVersion};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-
-pub const SUPPORTED_SCHEMA: i32 = 16;
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -38,6 +37,7 @@ pub struct ProviderSummary {
 #[derive(Debug)]
 pub struct StateReader {
     paths: Paths,
+    schema: SchemaVersion,
 }
 
 impl StateReader {
@@ -47,9 +47,9 @@ impl StateReader {
                 paths.database.display().to_string(),
             ));
         }
-        let reader = Self { paths };
-        reader.ensure_compatible()?;
-        Ok(reader)
+        let connection = open_database(&paths.database)?;
+        let schema = SchemaVersion::detect(&connection)?;
+        Ok(Self { paths, schema })
     }
 
     #[cfg(test)]
@@ -59,16 +59,9 @@ impl StateReader {
 
     pub fn providers(&self) -> Result<Vec<ProviderSummary>, AppError> {
         let connection = self.connection()?;
+        self.ensure_connection_schema(&connection)?;
         let mut statement = connection
-            .prepare(
-                "SELECT id, name, is_current FROM providers \
-                 WHERE app_type = 'codex' \
-                 ORDER BY \
-                    CASE WHEN sort_index IS NULL THEN 1 ELSE 0 END, \
-                    sort_index, \
-                    CASE WHEN created_at IS NULL THEN 0 ELSE 1 END, \
-                    created_at, name, id",
-            )
+            .prepare(self.schema.providers_query())
             .map_err(state_error)?;
         let rows = statement
             .query_map([], |row| {
@@ -137,36 +130,33 @@ impl StateReader {
             && file_current.as_deref() == Some(provider_id))
     }
 
-    fn ensure_compatible(&self) -> Result<(), AppError> {
+    pub(crate) fn ensure_schema_unchanged(&self) -> Result<SchemaVersion, AppError> {
         let connection = self.connection()?;
-        let found = connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
-            .map_err(state_error)?;
-        if found != SUPPORTED_SCHEMA {
-            return Err(AppError::IncompatibleSchema {
+        self.ensure_connection_schema(&connection)?;
+        self.schema.validate(&connection)?;
+        Ok(self.schema)
+    }
+
+    fn ensure_connection_schema(&self, connection: &Connection) -> Result<(), AppError> {
+        let found = read_schema_number(connection)?;
+        if found != self.schema.number() {
+            return Err(AppError::SchemaChanged {
+                opened: self.schema.number(),
                 found,
-                expected: SUPPORTED_SCHEMA,
             });
         }
         Ok(())
     }
 
     fn connection(&self) -> Result<Connection, AppError> {
-        Connection::open_with_flags(
-            &self.paths.database,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(state_error)
+        open_database(&self.paths.database)
     }
 
     fn db_current_id(&self) -> Result<Option<String>, AppError> {
         let connection = self.connection()?;
+        self.ensure_connection_schema(&connection)?;
         let mut statement = connection
-            .prepare(
-                "SELECT id FROM providers \
-                 WHERE app_type = 'codex' AND is_current = 1 \
-                 ORDER BY id LIMIT 1",
-            )
+            .prepare(self.schema.current_provider_query())
             .map_err(state_error)?;
         let mut rows = statement.query([]).map_err(state_error)?;
         rows.next()
@@ -194,6 +184,14 @@ impl StateReader {
     }
 }
 
+fn open_database(path: &Path) -> Result<Connection, AppError> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(state_error)
+}
+
 fn read_settings_current_id(path: &Path) -> Result<Option<String>, AppError> {
     if !path.exists() {
         return Ok(None);
@@ -217,15 +215,14 @@ mod tests {
     use rusqlite::params;
     use tempfile::TempDir;
 
-    fn fixture() -> (TempDir, StateReader) {
+    fn fixture(schema: SchemaVersion) -> (TempDir, StateReader) {
         let temp = TempDir::new().unwrap();
         let paths = Paths::for_home(temp.path().to_path_buf());
         std::fs::create_dir_all(paths.database.parent().unwrap()).unwrap();
         let connection = Connection::open(&paths.database).unwrap();
         connection
             .execute_batch(
-                "PRAGMA user_version = 16;
-                 CREATE TABLE providers (
+                "CREATE TABLE providers (
                     id TEXT NOT NULL,
                     app_type TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -236,18 +233,34 @@ mod tests {
                  );",
             )
             .unwrap();
+        if schema == SchemaVersion::V17 {
+            connection
+                .execute_batch(
+                    "CREATE TABLE session_usage_dedup (
+                        data_source TEXT NOT NULL,
+                        request_id TEXT NOT NULL,
+                        semantic_id TEXT NOT NULL,
+                        has_entry_id INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (data_source, request_id)
+                     );",
+                )
+                .unwrap();
+        }
+        connection
+            .pragma_update(None, "user_version", schema.number())
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO providers (id, app_type, name, is_current, sort_index)
                  VALUES (?1, 'codex', ?2, ?3, ?4)",
-                params!["one", "IPADS", true, 1],
+                params!["one", "Provider One", true, 1],
             )
             .unwrap();
         connection
             .execute(
                 "INSERT INTO providers (id, app_type, name, is_current, sort_index)
                  VALUES (?1, 'codex', ?2, ?3, ?4)",
-                params!["two", "CCTQ", false, 2],
+                params!["two", "Provider Two", false, 2],
             )
             .unwrap();
         drop(connection);
@@ -257,7 +270,7 @@ mod tests {
 
     #[test]
     fn settings_current_takes_precedence_over_database() {
-        let (_temp, reader) = fixture();
+        let (_temp, reader) = fixture(SchemaVersion::V16);
         std::fs::write(
             &reader.paths().settings,
             r#"{"currentProviderCodex":"two"}"#,
@@ -268,26 +281,60 @@ mod tests {
 
     #[test]
     fn name_matching_is_exact_and_case_sensitive() {
-        let (_temp, reader) = fixture();
-        assert_eq!(reader.by_name("IPADS").unwrap().id, "one");
+        let (_temp, reader) = fixture(SchemaVersion::V16);
+        assert_eq!(reader.by_name("Provider One").unwrap().id, "one");
         assert!(matches!(
-            reader.by_name("ipads"),
+            reader.by_name("provider one"),
             Err(AppError::ProviderNotFound(_))
         ));
     }
 
     #[test]
-    fn rejects_wrong_schema() {
-        let (temp, _reader) = fixture();
+    fn schema17_profile_reads_providers() {
+        let (_temp, reader) = fixture(SchemaVersion::V17);
+        assert_eq!(reader.providers().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejects_unknown_schema() {
+        let (temp, _reader) = fixture(SchemaVersion::V16);
+        let paths = Paths::for_home(temp.path().to_path_buf());
+        let connection = Connection::open(&paths.database).unwrap();
+        connection.pragma_update(None, "user_version", 18).unwrap();
+        drop(connection);
+        assert!(matches!(
+            StateReader::open(paths),
+            Err(AppError::IncompatibleSchema {
+                found: 18,
+                supported
+            }) if supported == vec![16, 17]
+        ));
+    }
+
+    #[test]
+    fn rejects_schema17_without_required_layout() {
+        let (temp, _reader) = fixture(SchemaVersion::V16);
         let paths = Paths::for_home(temp.path().to_path_buf());
         let connection = Connection::open(&paths.database).unwrap();
         connection.pragma_update(None, "user_version", 17).unwrap();
         drop(connection);
         assert!(matches!(
             StateReader::open(paths),
-            Err(AppError::IncompatibleSchema {
-                found: 17,
-                expected: 16
+            Err(AppError::IncompatibleSchemaLayout { schema: 17, .. })
+        ));
+    }
+
+    #[test]
+    fn detects_schema_change_after_open() {
+        let (_temp, reader) = fixture(SchemaVersion::V16);
+        let connection = Connection::open(&reader.paths().database).unwrap();
+        connection.pragma_update(None, "user_version", 17).unwrap();
+        drop(connection);
+        assert!(matches!(
+            reader.ensure_schema_unchanged(),
+            Err(AppError::SchemaChanged {
+                opened: 16,
+                found: 17
             })
         ));
     }

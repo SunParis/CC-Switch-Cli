@@ -6,8 +6,16 @@ pub enum AppError {
     #[error("CC Switch database not found at {0}")]
     DatabaseMissing(String),
 
-    #[error("unsupported CC Switch database schema {found}; expected {expected}")]
-    IncompatibleSchema { found: i32, expected: i32 },
+    #[error("unsupported CC Switch database schema {found}; supported schemas: {supported:?}")]
+    IncompatibleSchema { found: i32, supported: Vec<i32> },
+
+    #[error(
+        "CC Switch database schema {schema} does not match its compatibility profile: {detail}"
+    )]
+    IncompatibleSchemaLayout { schema: i32, detail: String },
+
+    #[error("CC Switch database schema changed while switching (opened as {opened}, now {found})")]
+    SchemaChanged { opened: i32, found: i32 },
 
     #[error("failed to read CC Switch state: {0}")]
     State(String),
@@ -37,7 +45,11 @@ pub enum AppError {
 impl AppError {
     pub fn exit_code(&self) -> ExitCode {
         let code = match self {
-            Self::DatabaseMissing(_) | Self::IncompatibleSchema { .. } | Self::State(_) => 3,
+            Self::DatabaseMissing(_)
+            | Self::IncompatibleSchema { .. }
+            | Self::IncompatibleSchemaLayout { .. }
+            | Self::SchemaChanged { .. }
+            | Self::State(_) => 3,
             Self::ProviderNotFound(_)
             | Self::AmbiguousProvider { .. }
             | Self::ProviderIdNotFound(_) => 4,
@@ -51,6 +63,8 @@ impl AppError {
         match self {
             Self::DatabaseMissing(_) => "database_missing",
             Self::IncompatibleSchema { .. } => "incompatible_schema",
+            Self::IncompatibleSchemaLayout { .. } => "incompatible_schema_layout",
+            Self::SchemaChanged { .. } => "schema_changed",
             Self::State(_) => "state_error",
             Self::ProviderNotFound(_) => "provider_not_found",
             Self::AmbiguousProvider { .. } => "ambiguous_provider",
