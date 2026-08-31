@@ -233,7 +233,7 @@ mod tests {
                  );",
             )
             .unwrap();
-        if schema == SchemaVersion::V17 {
+        if matches!(schema, SchemaVersion::V17 | SchemaVersion::V18) {
             connection
                 .execute_batch(
                     "CREATE TABLE session_usage_dedup (
@@ -242,7 +242,21 @@ mod tests {
                         semantic_id TEXT NOT NULL,
                         has_entry_id INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (data_source, request_id)
+                     );
+                     CREATE TABLE session_log_sync (
+                        file_path TEXT PRIMARY KEY,
+                        last_modified INTEGER NOT NULL,
+                        last_line_offset INTEGER NOT NULL DEFAULT 0,
+                        last_synced_at INTEGER NOT NULL
                      );",
+                )
+                .unwrap();
+        }
+        if schema == SchemaVersion::V18 {
+            connection
+                .execute_batch(
+                    "ALTER TABLE session_log_sync ADD COLUMN last_byte_offset INTEGER;
+                     ALTER TABLE session_log_sync ADD COLUMN last_tail_fingerprint INTEGER;",
                 )
                 .unwrap();
         }
@@ -296,18 +310,24 @@ mod tests {
     }
 
     #[test]
+    fn schema18_profile_reads_providers() {
+        let (_temp, reader) = fixture(SchemaVersion::V18);
+        assert_eq!(reader.providers().unwrap().len(), 2);
+    }
+
+    #[test]
     fn rejects_unknown_schema() {
         let (temp, _reader) = fixture(SchemaVersion::V16);
         let paths = Paths::for_home(temp.path().to_path_buf());
         let connection = Connection::open(&paths.database).unwrap();
-        connection.pragma_update(None, "user_version", 18).unwrap();
+        connection.pragma_update(None, "user_version", 19).unwrap();
         drop(connection);
         assert!(matches!(
             StateReader::open(paths),
             Err(AppError::IncompatibleSchema {
-                found: 18,
+                found: 19,
                 supported
-            }) if supported == vec![16, 17]
+            }) if supported == vec![16, 17, 18]
         ));
     }
 
@@ -321,6 +341,19 @@ mod tests {
         assert!(matches!(
             StateReader::open(paths),
             Err(AppError::IncompatibleSchemaLayout { schema: 17, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_schema18_without_byte_cursor_layout() {
+        let (temp, _reader) = fixture(SchemaVersion::V17);
+        let paths = Paths::for_home(temp.path().to_path_buf());
+        let connection = Connection::open(&paths.database).unwrap();
+        connection.pragma_update(None, "user_version", 18).unwrap();
+        drop(connection);
+        assert!(matches!(
+            StateReader::open(paths),
+            Err(AppError::IncompatibleSchemaLayout { schema: 18, .. })
         ));
     }
 

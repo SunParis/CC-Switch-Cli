@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use cc_switch_schema16 as schema16;
 use cc_switch_schema17 as schema17;
+use cc_switch_schema18 as schema18;
 
 use crate::error::AppError;
 use crate::schema::DirectGeneration;
@@ -12,6 +13,7 @@ pub fn switch(reader: &StateReader, provider_id: &str) -> Result<Vec<String>, Ap
     let warnings = match schema.direct_generation() {
         DirectGeneration::V16 => switch_schema16(provider_id),
         DirectGeneration::V17 => switch_schema17(provider_id),
+        DirectGeneration::V18 => switch_schema18(provider_id),
     }?;
     reader.ensure_schema_unchanged()?;
     Ok(warnings)
@@ -39,6 +41,19 @@ fn switch_schema17(provider_id: &str) -> Result<Vec<String>, AppError> {
 
     let state = schema17::AppState::new(database);
     schema17::ProviderService::switch(&state, schema17::AppType::Codex, provider_id)
+        .map(|result| result.warnings)
+        .map_err(upstream_error)
+}
+
+fn switch_schema18(provider_id: &str) -> Result<Vec<String>, AppError> {
+    let database = Arc::new(schema18::Database::init().map_err(upstream_error)?);
+    let (proxy_enabled, _) = database.get_proxy_flags_sync("codex");
+    database
+        .set_proxy_flags_sync("codex", proxy_enabled, false)
+        .map_err(upstream_error)?;
+
+    let state = schema18::AppState::new(database);
+    schema18::ProviderService::switch(&state, schema18::AppType::Codex, provider_id)
         .map(|result| result.warnings)
         .map_err(upstream_error)
 }
@@ -99,6 +114,10 @@ mod tests {
         schema17::Provider::with_id(id.into(), name.into(), provider_settings(key), None)
     }
 
+    fn provider18(id: &str, name: &str, key: &str) -> schema18::Provider {
+        schema18::Provider::with_id(id.into(), name.into(), provider_settings(key), None)
+    }
+
     #[test]
     fn schema16_direct_switch_preserves_schema_and_proxy_state() {
         let _lock = TEST_HOME_LOCK.lock().unwrap();
@@ -152,6 +171,34 @@ mod tests {
             SchemaVersion::V17
         );
         let database = schema17::Database::init().unwrap();
+        assert_eq!(database.get_proxy_flags_sync("codex"), (true, false));
+    }
+
+    #[test]
+    fn schema18_direct_switch_preserves_schema_and_proxy_state() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = TestHome::set(temp.path());
+        let database = schema18::Database::init().unwrap();
+        database
+            .save_provider("codex", &provider18("one", "One", "test-one"))
+            .unwrap();
+        database
+            .save_provider("codex", &provider18("two", "Two", "test-two"))
+            .unwrap();
+        database.set_current_provider("codex", "one").unwrap();
+        database.set_proxy_flags_sync("codex", true, true).unwrap();
+        drop(database);
+
+        let reader = StateReader::open(Paths::for_home(temp.path().to_path_buf())).unwrap();
+        switch(&reader, "two").unwrap();
+
+        assert!(reader.has_converged_to("two").unwrap());
+        assert_eq!(
+            reader.ensure_schema_unchanged().unwrap(),
+            SchemaVersion::V18
+        );
+        let database = schema18::Database::init().unwrap();
         assert_eq!(database.get_proxy_flags_sync("codex"), (true, false));
     }
 }

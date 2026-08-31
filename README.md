@@ -11,8 +11,8 @@ cc-switch-cli codex --name 'XXX'
 ## Compatibility
 
 - Linux
-- Validated against CC Switch `3.19.2` and `3.20.0`
-- CC Switch SQLite schemas `16` and `17`
+- Validated against CC Switch `3.19.2`, `3.20.0`, and `3.20.1`
+- CC Switch SQLite schemas `16`, `17`, and `18`
 - Codex providers
 
 The CLI does not inspect or reject the installed CC Switch package version. Instead, it selects an
@@ -55,9 +55,10 @@ When CC Switch is not running, the compatibility profile selects the matching up
 
 - Schema `16`: CC Switch `3.19.2`, commit `43eaf07355af145aebfee301801779e824d4c221`
 - Schema `17`: CC Switch `3.20.0`, commit `0b5da510168914b251481654a568c3ffacd62cf4`
+- Schema `18`: CC Switch `3.20.1`, commit `3217f72596f2d1c0f879f0a05f83803825d9809f`
 
-Keeping separate direct adapters prevents the schema `17` implementation from silently migrating a
-schema `16` database. The CLI verifies `PRAGMA user_version` immediately before and after a direct
+Keeping separate direct adapters prevents a newer implementation from silently migrating an older
+supported database. The CLI verifies `PRAGMA user_version` immediately before and after a direct
 switch. If the GUI is running but its tray D-Bus interface is unavailable, the CLI returns an error
 instead of falling back to direct writes.
 
@@ -74,8 +75,10 @@ Credentials, URLs, and provider configuration are never printed.
 
 Schema compatibility is centralized in `src/schema.rs`. Each supported schema explicitly selects a
 normalized provider-table layout, validates its required database shape, and maps to a reviewed
-direct-switch adapter. Schemas `16` and `17` currently share the same provider layout while using
-different direct adapters.
+direct-switch adapter. Schemas `16`, `17`, and `18` currently share the same provider layout while
+using different direct adapters. Schema `17` additionally requires its persistent session-usage
+deduplication table. Schema `18` also requires the byte cursor and tail fingerprint columns added to
+`session_log_sync` by the 17-to-18 migration.
 
 Supporting a future schema requires:
 

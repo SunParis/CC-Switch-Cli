@@ -22,16 +22,29 @@ const PROVIDERS_V1_COLUMNS: &[&str] = &[
     "created_at",
 ];
 
+const SCHEMA_17_REQUIREMENTS: &[LayoutRequirement] =
+    &[LayoutRequirement::Table("session_usage_dedup")];
+
+const SCHEMA_18_REQUIREMENTS: &[LayoutRequirement] = &[
+    LayoutRequirement::Table("session_usage_dedup"),
+    LayoutRequirement::TableColumns {
+        table: "session_log_sync",
+        columns: &["last_byte_offset", "last_tail_fingerprint"],
+    },
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaVersion {
     V16,
     V17,
+    V18,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectGeneration {
     V16,
     V17,
+    V18,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,14 +52,32 @@ enum StateLayout {
     ProvidersV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutRequirement {
+    Table(&'static str),
+    TableColumns {
+        table: &'static str,
+        columns: &'static [&'static str],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompatibilityProfile {
+    number: i32,
+    state_layout: StateLayout,
+    direct_generation: DirectGeneration,
+    requirements: &'static [LayoutRequirement],
+}
+
 impl SchemaVersion {
-    const SUPPORTED: [Self; 2] = [Self::V16, Self::V17];
+    const SUPPORTED: [Self; 3] = [Self::V16, Self::V17, Self::V18];
 
     pub fn detect(connection: &Connection) -> Result<Self, AppError> {
         let found = read_schema_number(connection)?;
         let schema = match found {
             16 => Self::V16,
             17 => Self::V17,
+            18 => Self::V18,
             _ => {
                 return Err(AppError::IncompatibleSchema {
                     found,
@@ -62,10 +93,7 @@ impl SchemaVersion {
     }
 
     pub const fn number(self) -> i32 {
-        match self {
-            Self::V16 => 16,
-            Self::V17 => 17,
-        }
+        self.profile().number
     }
 
     pub const fn providers_query(self) -> &'static str {
@@ -77,23 +105,42 @@ impl SchemaVersion {
     }
 
     pub const fn direct_generation(self) -> DirectGeneration {
-        match self {
-            Self::V16 => DirectGeneration::V16,
-            Self::V17 => DirectGeneration::V17,
-        }
+        self.profile().direct_generation
     }
 
     pub fn validate(self, connection: &Connection) -> Result<(), AppError> {
-        self.state_layout().validate(connection, self)?;
-        match self {
-            Self::V16 => Ok(()),
-            Self::V17 => require_table(connection, self, "session_usage_dedup"),
+        let profile = self.profile();
+        profile.state_layout.validate(connection, self)?;
+        for requirement in profile.requirements {
+            requirement.validate(connection, self)?;
         }
+        Ok(())
     }
 
     const fn state_layout(self) -> StateLayout {
+        self.profile().state_layout
+    }
+
+    const fn profile(self) -> CompatibilityProfile {
         match self {
-            Self::V16 | Self::V17 => StateLayout::ProvidersV1,
+            Self::V16 => CompatibilityProfile {
+                number: 16,
+                state_layout: StateLayout::ProvidersV1,
+                direct_generation: DirectGeneration::V16,
+                requirements: &[],
+            },
+            Self::V17 => CompatibilityProfile {
+                number: 17,
+                state_layout: StateLayout::ProvidersV1,
+                direct_generation: DirectGeneration::V17,
+                requirements: SCHEMA_17_REQUIREMENTS,
+            },
+            Self::V18 => CompatibilityProfile {
+                number: 18,
+                state_layout: StateLayout::ProvidersV1,
+                direct_generation: DirectGeneration::V18,
+                requirements: SCHEMA_18_REQUIREMENTS,
+            },
         }
     }
 }
@@ -114,7 +161,20 @@ impl StateLayout {
     fn validate(self, connection: &Connection, schema: SchemaVersion) -> Result<(), AppError> {
         match self {
             Self::ProvidersV1 => {
+                require_table(connection, schema, "providers")?;
                 require_columns(connection, schema, "providers", PROVIDERS_V1_COLUMNS)
+            }
+        }
+    }
+}
+
+impl LayoutRequirement {
+    fn validate(self, connection: &Connection, schema: SchemaVersion) -> Result<(), AppError> {
+        match self {
+            Self::Table(table) => require_table(connection, schema, table),
+            Self::TableColumns { table, columns } => {
+                require_table(connection, schema, table)?;
+                require_columns(connection, schema, table, columns)
             }
         }
     }

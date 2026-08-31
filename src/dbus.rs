@@ -293,7 +293,7 @@ fn map_target_item<'a>(
         let blocked_label = format!("{} \u{26D4}", provider.name);
         if label != provider.name && label != blocked_label {
             return Err(AppError::Gui(
-                "tray provider order does not match the pinned CC Switch 3.19.2 layout".into(),
+                "tray provider order does not match the supported CC Switch layout".into(),
             ));
         }
     }
