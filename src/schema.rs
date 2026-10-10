@@ -6,8 +6,8 @@ const PROVIDERS_V1_QUERY: &str = "SELECT id, name, is_current FROM providers \
      ORDER BY \
         CASE WHEN sort_index IS NULL THEN 1 ELSE 0 END, \
         sort_index, \
-        CASE WHEN created_at IS NULL THEN 0 ELSE 1 END, \
-        created_at, name, id";
+        created_at, \
+        CASE WHEN sort_index IS NULL AND created_at IS NULL THEN name END, id";
 
 const CURRENT_PROVIDER_V1_QUERY: &str = "SELECT id FROM providers \
      WHERE app_type = 'codex' AND is_current = 1 \
@@ -33,11 +33,29 @@ const SCHEMA_18_REQUIREMENTS: &[LayoutRequirement] = &[
     },
 ];
 
+const SCHEMA_20_REQUIREMENTS: &[LayoutRequirement] = &[
+    LayoutRequirement::Table("session_usage_dedup"),
+    LayoutRequirement::TableColumns {
+        table: "session_log_sync",
+        columns: &["last_byte_offset", "last_tail_fingerprint"],
+    },
+    LayoutRequirement::TableColumns {
+        table: "mcp_servers",
+        columns: &["enabled_mcode", "enabled_pi"],
+    },
+    LayoutRequirement::TableColumns {
+        table: "skills",
+        columns: &["enabled_mcode"],
+    },
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SchemaVersion {
     V16,
     V17,
     V18,
+    V20,
+    Unknown(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +63,8 @@ pub enum DirectGeneration {
     V16,
     V17,
     V18,
+    V20,
+    InstalledGui,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,23 +90,14 @@ struct CompatibilityProfile {
 }
 
 impl SchemaVersion {
-    const SUPPORTED: [Self; 3] = [Self::V16, Self::V17, Self::V18];
-
     pub fn detect(connection: &Connection) -> Result<Self, AppError> {
         let found = read_schema_number(connection)?;
         let schema = match found {
             16 => Self::V16,
             17 => Self::V17,
             18 => Self::V18,
-            _ => {
-                return Err(AppError::IncompatibleSchema {
-                    found,
-                    supported: Self::SUPPORTED
-                        .iter()
-                        .map(|schema| schema.number())
-                        .collect(),
-                });
-            }
+            20 => Self::V20,
+            _ => Self::Unknown(found),
         };
         schema.validate(connection)?;
         Ok(schema)
@@ -106,6 +117,21 @@ impl SchemaVersion {
 
     pub const fn direct_generation(self) -> DirectGeneration {
         self.profile().direct_generation
+    }
+
+    pub fn warning(self) -> Option<String> {
+        match self {
+            Self::Unknown(number) => Some(format!(
+                "unverified_schema: CC Switch database schema {number} has not been validated; \
+                 attempting compatible reads and switching through the installed CC Switch GUI \
+                 (started if needed)"
+            )),
+            _ => None,
+        }
+    }
+
+    pub const fn uses_live_state(self) -> bool {
+        matches!(self, Self::V20 | Self::Unknown(_))
     }
 
     pub fn validate(self, connection: &Connection) -> Result<(), AppError> {
@@ -140,6 +166,18 @@ impl SchemaVersion {
                 state_layout: StateLayout::ProvidersV1,
                 direct_generation: DirectGeneration::V18,
                 requirements: SCHEMA_18_REQUIREMENTS,
+            },
+            Self::V20 => CompatibilityProfile {
+                number: 20,
+                state_layout: StateLayout::ProvidersV1,
+                direct_generation: DirectGeneration::V20,
+                requirements: SCHEMA_20_REQUIREMENTS,
+            },
+            Self::Unknown(number) => CompatibilityProfile {
+                number,
+                state_layout: StateLayout::ProvidersV1,
+                direct_generation: DirectGeneration::InstalledGui,
+                requirements: &[],
             },
         }
     }

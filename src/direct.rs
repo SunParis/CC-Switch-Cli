@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cc_switch_schema16 as schema16;
 use cc_switch_schema17 as schema17;
 use cc_switch_schema18 as schema18;
+use cc_switch_schema20 as schema20;
 
 use crate::error::AppError;
 use crate::schema::DirectGeneration;
@@ -14,6 +15,10 @@ pub fn switch(reader: &StateReader, provider_id: &str) -> Result<Vec<String>, Ap
         DirectGeneration::V16 => switch_schema16(provider_id),
         DirectGeneration::V17 => switch_schema17(provider_id),
         DirectGeneration::V18 => switch_schema18(provider_id),
+        DirectGeneration::V20 => switch_schema20(provider_id),
+        DirectGeneration::InstalledGui => Err(AppError::Switch(
+            "this operation must be dispatched through the installed CC Switch GUI".into(),
+        )),
     }?;
     reader.ensure_schema_unchanged()?;
     Ok(warnings)
@@ -60,6 +65,23 @@ fn switch_schema18(provider_id: &str) -> Result<Vec<String>, AppError> {
 
 fn upstream_error(_error: impl std::fmt::Display) -> AppError {
     AppError::Switch("the pinned CC Switch operation returned an error".into())
+}
+
+fn switch_schema20(provider_id: &str) -> Result<Vec<String>, AppError> {
+    let database = Arc::new(schema20::Database::init().map_err(upstream_error)?);
+    let state = schema20::AppState::new(database);
+    if schema20::mode::current::is_proxy(&schema20::AppType::Codex)
+        && state.db.get_proxy_flags_sync("codex").1
+        && !schema20::mode::stack::stack_mode_now(&schema20::AppType::Codex)
+    {
+        return Err(AppError::Switch(
+            "Codex auto-failover is active; disable it in CC Switch before switching manually"
+                .into(),
+        ));
+    }
+    schema20::ProviderService::switch(&state, schema20::AppType::Codex, provider_id)
+        .map(|result| result.warnings)
+        .map_err(upstream_error)
 }
 
 #[cfg(test)]
@@ -200,5 +222,40 @@ mod tests {
         );
         let database = schema18::Database::init().unwrap();
         assert_eq!(database.get_proxy_flags_sync("codex"), (true, false));
+    }
+
+    #[test]
+    fn schema20_switch_writes_live_config_preserves_schema_and_failover_setting() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = TestHome::set(temp.path());
+        let database = schema20::Database::init().unwrap();
+        for (id, name, key) in [("one", "One", "test-one"), ("two", "Two", "test-two")] {
+            let provider =
+                schema20::Provider::with_id(id.into(), name.into(), provider_settings(key), None);
+            database.save_provider("codex", &provider).unwrap();
+        }
+        database.set_current_provider("codex", "one").unwrap();
+        database.set_proxy_flags_sync("codex", true, true).unwrap();
+        drop(database);
+        let reader = StateReader::open(Paths::for_home(temp.path().to_path_buf())).unwrap();
+
+        switch(&reader, "two").unwrap();
+
+        assert!(reader.has_converged_to("two").unwrap());
+        assert_eq!(
+            reader.ensure_schema_unchanged().unwrap(),
+            SchemaVersion::V20
+        );
+        let config = std::fs::read_to_string(temp.path().join(".codex/config.toml")).unwrap();
+        assert!(config.contains("experimental_bearer_token = \"test-two\""));
+        let database = schema20::Database::init().unwrap();
+        assert_eq!(database.get_proxy_flags_sync("codex"), (true, true));
+
+        assert!(matches!(
+            switch(&reader, "missing"),
+            Err(AppError::Switch(_))
+        ));
+        assert!(reader.has_converged_to("two").unwrap());
     }
 }

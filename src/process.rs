@@ -1,4 +1,16 @@
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
+
+use crate::error::AppError;
+
+pub fn start_gui() -> Result<Child, AppError> {
+    Command::new("cc-switch")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| AppError::GuiUnavailable(format!("cannot start cc-switch: {error}")))
+}
 
 pub fn is_gui_running() -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {

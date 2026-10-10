@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::schema::{read_schema_number, SchemaVersion};
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -9,11 +9,15 @@ use std::path::{Path, PathBuf};
 pub struct Paths {
     pub database: PathBuf,
     pub settings: PathBuf,
+    pub live_state: PathBuf,
 }
 
 impl Paths {
     pub fn discover() -> Result<Self, AppError> {
-        let home = dirs::home_dir()
+        let home = std::env::var_os("CC_SWITCH_TEST_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
             .ok_or_else(|| AppError::State("cannot determine the home directory".into()))?;
         Ok(Self::for_home(home))
     }
@@ -23,6 +27,7 @@ impl Paths {
         Self {
             database: app_dir.join("cc-switch.db"),
             settings: app_dir.join("settings.json"),
+            live_state: app_dir.join("live-state.json"),
         }
     }
 }
@@ -40,6 +45,13 @@ pub struct StateReader {
     schema: SchemaVersion,
 }
 
+#[derive(Default, Deserialize)]
+struct CodexLiveState {
+    mode: Option<String>,
+    proxy_route: Option<String>,
+    pending: Option<Value>,
+}
+
 impl StateReader {
     pub fn open(paths: Paths) -> Result<Self, AppError> {
         if !paths.database.is_file() {
@@ -55,6 +67,14 @@ impl StateReader {
     #[cfg(test)]
     pub fn paths(&self) -> &Paths {
         &self.paths
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        self.schema.warning().into_iter().collect()
+    }
+
+    pub fn requires_installed_gui(&self) -> bool {
+        self.schema.direct_generation() == crate::schema::DirectGeneration::InstalledGui
     }
 
     pub fn providers(&self) -> Result<Vec<ProviderSummary>, AppError> {
@@ -124,6 +144,21 @@ impl StateReader {
     }
 
     pub fn has_converged_to(&self, provider_id: &str) -> Result<bool, AppError> {
+        let live = self.codex_live_state()?;
+        if live.pending.is_some() {
+            return Ok(false);
+        }
+        if live.mode.as_deref() == Some("proxy") {
+            if let Some(route) = live.proxy_route {
+                if self
+                    .providers()?
+                    .iter()
+                    .any(|provider| provider.id == route)
+                {
+                    return Ok(route == provider_id);
+                }
+            }
+        }
         let db_current = self.db_current_id()?;
         let file_current = self.settings_current_id()?;
         Ok(db_current.as_deref() == Some(provider_id)
@@ -169,6 +204,14 @@ impl StateReader {
         &self,
         providers: &[(String, String, bool)],
     ) -> Result<Option<String>, AppError> {
+        let live = self.codex_live_state()?;
+        if live.mode.as_deref() == Some("proxy") {
+            if let Some(route) = live.proxy_route {
+                if providers.iter().any(|(id, _, _)| id == &route) {
+                    return Ok(Some(route));
+                }
+            }
+        }
         if let Some(local) = self.settings_current_id()? {
             if providers.iter().any(|(id, _, _)| id == &local) {
                 return Ok(Some(local));
@@ -181,6 +224,33 @@ impl StateReader {
 
     fn settings_current_id(&self) -> Result<Option<String>, AppError> {
         read_settings_current_id(&self.paths.settings)
+    }
+
+    fn codex_live_state(&self) -> Result<CodexLiveState, AppError> {
+        if !self.schema.uses_live_state() {
+            return Ok(CodexLiveState::default());
+        }
+        let text = match std::fs::read_to_string(&self.paths.live_state) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CodexLiveState::default());
+            }
+            Err(error) => return Err(state_error(error)),
+        };
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|_| AppError::State("invalid live-state.json".into()))?;
+        if !value.is_object() || value.get("apps").is_some_and(|apps| !apps.is_object()) {
+            return Err(AppError::State("invalid live-state.json structure".into()));
+        }
+        let Some(codex) = value.get("apps").and_then(|apps| apps.get("codex")) else {
+            return Ok(CodexLiveState::default());
+        };
+        let state: CodexLiveState = serde_json::from_value(codex.clone())
+            .map_err(|_| AppError::State("invalid Codex live state".into()))?;
+        if !matches!(state.mode.as_deref(), None | Some("direct" | "proxy")) {
+            return Err(AppError::State("unrecognized Codex live mode".into()));
+        }
+        Ok(state)
     }
 }
 
@@ -233,7 +303,10 @@ mod tests {
                  );",
             )
             .unwrap();
-        if matches!(schema, SchemaVersion::V17 | SchemaVersion::V18) {
+        if matches!(
+            schema,
+            SchemaVersion::V17 | SchemaVersion::V18 | SchemaVersion::V20
+        ) {
             connection
                 .execute_batch(
                     "CREATE TABLE session_usage_dedup (
@@ -252,11 +325,19 @@ mod tests {
                 )
                 .unwrap();
         }
-        if schema == SchemaVersion::V18 {
+        if matches!(schema, SchemaVersion::V18 | SchemaVersion::V20) {
             connection
                 .execute_batch(
                     "ALTER TABLE session_log_sync ADD COLUMN last_byte_offset INTEGER;
                      ALTER TABLE session_log_sync ADD COLUMN last_tail_fingerprint INTEGER;",
+                )
+                .unwrap();
+        }
+        if schema == SchemaVersion::V20 {
+            connection
+                .execute_batch(
+                    "CREATE TABLE mcp_servers (enabled_mcode BOOLEAN, enabled_pi BOOLEAN);
+                 CREATE TABLE skills (enabled_mcode BOOLEAN);",
                 )
                 .unwrap();
         }
@@ -316,18 +397,111 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_schema() {
-        let (temp, _reader) = fixture(SchemaVersion::V16);
-        let paths = Paths::for_home(temp.path().to_path_buf());
-        let connection = Connection::open(&paths.database).unwrap();
-        connection.pragma_update(None, "user_version", 19).unwrap();
-        drop(connection);
+    fn unknown_schemas_warn_and_read_without_migration() {
+        for number in [0, 15, 19, 21, 999] {
+            let (_temp, reader) = fixture(SchemaVersion::Unknown(number));
+            assert_eq!(reader.providers().unwrap().len(), 2);
+            assert_eq!(reader.warnings().len(), 1);
+            assert!(reader.requires_installed_gui());
+            assert_eq!(reader.ensure_schema_unchanged().unwrap().number(), number);
+        }
+    }
+
+    #[test]
+    fn schema20_reads_without_warning() {
+        let (_temp, reader) = fixture(SchemaVersion::V20);
+        assert_eq!(reader.current().unwrap().unwrap().id, "one");
+        assert!(reader.warnings().is_empty());
+        assert!(!reader.requires_installed_gui());
+    }
+
+    #[test]
+    fn tied_sort_indices_preserve_upstream_database_order() {
+        let (_temp, reader) = fixture(SchemaVersion::V20);
+        Connection::open(&reader.paths.database)
+            .unwrap()
+            .execute_batch(
+                "UPDATE providers SET sort_index = 1, created_at = 10;
+             UPDATE providers SET name = 'Z' WHERE id = 'one';
+             UPDATE providers SET name = 'A' WHERE id = 'two';",
+            )
+            .unwrap();
+        let ids: Vec<_> = reader
+            .providers()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, ["one", "two"]);
+    }
+
+    #[test]
+    fn proxy_route_takes_precedence_and_converges_without_changing_direct_pointer() {
+        for schema in [SchemaVersion::V20, SchemaVersion::Unknown(21)] {
+            let (_temp, reader) = fixture(schema);
+            std::fs::write(&reader.paths.settings, r#"{"currentProviderCodex":"one"}"#).unwrap();
+            std::fs::write(
+                &reader.paths.live_state,
+                r#"{"apps":{"codex":{"mode":"proxy","proxy_route":"two"}}}"#,
+            )
+            .unwrap();
+            assert_eq!(reader.current().unwrap().unwrap().id, "two");
+            assert!(reader.has_converged_to("two").unwrap());
+            assert!(!reader.has_converged_to("one").unwrap());
+        }
+    }
+
+    #[test]
+    fn direct_mode_ignores_saved_proxy_route() {
+        let (_temp, reader) = fixture(SchemaVersion::V20);
+        std::fs::write(&reader.paths.settings, r#"{"currentProviderCodex":"one"}"#).unwrap();
+        std::fs::write(
+            &reader.paths.live_state,
+            r#"{"apps":{"codex":{"mode":"direct","proxy_route":"two"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(reader.current().unwrap().unwrap().id, "one");
+        assert!(reader.has_converged_to("one").unwrap());
+    }
+
+    #[test]
+    fn pending_switch_does_not_report_success() {
+        let (_temp, reader) = fixture(SchemaVersion::V20);
+        std::fs::write(
+            &reader.paths.live_state,
+            r#"{"apps":{"codex":{"mode":"proxy","proxy_route":"two","pending":{}}}}"#,
+        )
+        .unwrap();
+        assert!(!reader.has_converged_to("two").unwrap());
+    }
+
+    #[test]
+    fn malformed_live_state_still_errors() {
+        let (_temp, reader) = fixture(SchemaVersion::Unknown(21));
+        std::fs::write(&reader.paths.live_state, "invalid").unwrap();
+        assert!(matches!(reader.current(), Err(AppError::State(_))));
+    }
+
+    #[test]
+    fn unknown_schema_with_unreadable_provider_layout_still_errors() {
+        let (_temp, reader) = fixture(SchemaVersion::Unknown(21));
+        Connection::open(&reader.paths.database)
+            .unwrap()
+            .execute_batch("ALTER TABLE providers DROP COLUMN name;")
+            .unwrap();
+        assert!(matches!(reader.providers(), Err(AppError::State(_))));
+    }
+
+    #[test]
+    fn schema20_requires_pi_mcp_column() {
+        let (_temp, reader) = fixture(SchemaVersion::V20);
+        Connection::open(&reader.paths.database)
+            .unwrap()
+            .execute_batch("ALTER TABLE mcp_servers DROP COLUMN enabled_pi;")
+            .unwrap();
         assert!(matches!(
-            StateReader::open(paths),
-            Err(AppError::IncompatibleSchema {
-                found: 19,
-                supported
-            }) if supported == vec![16, 17, 18]
+            StateReader::open(reader.paths),
+            Err(AppError::IncompatibleSchemaLayout { schema: 20, .. })
         ));
     }
 

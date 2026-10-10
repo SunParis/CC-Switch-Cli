@@ -18,12 +18,14 @@ use std::time::{Duration, Instant};
 struct ProviderListOutput {
     app: &'static str,
     providers: Vec<ProviderSummary>,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct CurrentOutput {
     app: &'static str,
     provider: Option<ProviderSummary>,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +58,18 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<(), AppError> {
     let reader = StateReader::open(Paths::discover()?)?;
+    for warning in reader.warnings() {
+        if cli.json {
+            eprintln!(
+                "{}",
+                serde_json::json!({"warning": {
+                    "kind": "unverified_schema", "message": warning
+                }})
+            );
+        } else {
+            eprintln!("warning: {warning}");
+        }
+    }
     let gui_running = process::is_gui_running();
     match &cli.command {
         Command::Codex(args) if args.list => print_list(&reader, cli.json),
@@ -86,15 +100,21 @@ fn switch_provider(
                 provider,
                 backend: "noop",
                 changed: false,
-                warnings: Vec::new(),
+                warnings: reader.warnings(),
             },
             json,
         );
     }
 
     let providers = reader.providers()?;
-    let (backend, warnings, tray) = if gui_running {
-        let tray = dbus::TrayClient::connect()?;
+    let use_gui = gui_running || reader.requires_installed_gui();
+    let (backend, mut warnings, tray) = if use_gui {
+        let tray = if gui_running {
+            dbus::TrayClient::connect()?
+        } else {
+            start_gui_and_connect()?
+        };
+        reader.ensure_schema_unchanged()?;
         tray.activate(&providers, &provider.id)?;
         ("dbus", Vec::new(), Some(tray))
     } else {
@@ -105,6 +125,8 @@ fn switch_provider(
         }
         ("direct", direct::switch(reader, &provider.id)?, None)
     };
+
+    warnings.extend(reader.warnings());
 
     wait_for_convergence(reader, tray.as_ref(), &providers, &provider.id)?;
     let provider = reader.by_id(&provider.id)?;
@@ -130,7 +152,7 @@ fn wait_for_convergence(
     loop {
         let disk_ready = reader.has_converged_to(provider_id)?;
         let tray_ready = match tray {
-            Some(tray) => tray.is_selected(providers, provider_id).unwrap_or(false),
+            Some(tray) => tray.is_selected(providers, provider_id)?,
             None => true,
         };
         if disk_ready && tray_ready {
@@ -138,6 +160,32 @@ fn wait_for_convergence(
         }
         if Instant::now() >= deadline {
             return Err(AppError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn start_gui_and_connect() -> Result<dbus::TrayClient, AppError> {
+    let mut child = process::start_gui()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match dbus::TrayClient::connect() {
+            Ok(tray) => {
+                // Keep the GUI running to own proxy state and subsequent switches.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(tray);
+            }
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => {}
+        }
+        if let Some(status) = child.try_wait().map_err(|error| {
+            AppError::GuiUnavailable(format!("cannot check CC Switch startup: {error}"))
+        })? {
+            return Err(AppError::GuiUnavailable(format!(
+                "CC Switch exited before registering its tray interface ({status})"
+            )));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -154,7 +202,11 @@ fn print_switch(output: SwitchOutput, json: bool) -> Result<(), AppError> {
             "Switched Codex to {} ({}) via {}.",
             output.provider.name, output.provider.id, output.backend
         );
-        for warning in output.warnings {
+        for warning in output
+            .warnings
+            .iter()
+            .filter(|warning| !warning.starts_with("unverified_schema:"))
+        {
             eprintln!("warning: {warning}");
         }
     } else {
@@ -173,7 +225,8 @@ fn print_list(reader: &StateReader, json: bool) -> Result<(), AppError> {
             "{}",
             serde_json::to_string(&ProviderListOutput {
                 app: "codex",
-                providers
+                providers,
+                warnings: reader.warnings(),
             })
             .map_err(|error| AppError::State(error.to_string()))?
         );
@@ -198,7 +251,8 @@ fn print_current(reader: &StateReader, json: bool) -> Result<(), AppError> {
             "{}",
             serde_json::to_string(&CurrentOutput {
                 app: "codex",
-                provider
+                provider,
+                warnings: reader.warnings()
             })
             .map_err(|error| AppError::State(error.to_string()))?
         );
