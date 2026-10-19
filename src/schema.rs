@@ -67,6 +67,29 @@ pub enum DirectGeneration {
     InstalledGui,
 }
 
+impl DirectGeneration {
+    // A schema number describes SQLite, not the device-local settings format.
+    // Inspect the actual adapter's deserializer before letting it rewrite that file.
+    pub fn supports_settings(self, text: &str) -> bool {
+        match self {
+            Self::V16 => settings_are_understood::<cc_switch_schema16::AppSettings>(text),
+            Self::V17 => settings_are_understood::<cc_switch_schema17::AppSettings>(text),
+            Self::V18 => settings_are_understood::<cc_switch_schema18::AppSettings>(text),
+            Self::V20 => settings_are_understood::<cc_switch_schema20::AppSettings>(
+                text.strip_prefix('\u{feff}').unwrap_or(text),
+            ),
+            Self::InstalledGui => true,
+        }
+    }
+}
+
+fn settings_are_understood<T: serde::de::DeserializeOwned>(text: &str) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let mut ignored = false;
+    let result: Result<T, _> = serde_ignored::deserialize(&mut deserializer, |_| ignored = true);
+    result.is_ok() && !ignored && deserializer.end().is_ok()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StateLayout {
     ProvidersV1,

@@ -60,10 +60,13 @@ fn run(cli: &Cli) -> Result<(), AppError> {
     let reader = StateReader::open(Paths::discover()?)?;
     for warning in reader.warnings() {
         if cli.json {
+            let kind = warning
+                .split_once(':')
+                .map_or("compatibility_warning", |(kind, _)| kind);
             eprintln!(
                 "{}",
                 serde_json::json!({"warning": {
-                    "kind": "unverified_schema", "message": warning
+                    "kind": kind, "message": warning
                 }})
             );
         } else {
@@ -202,11 +205,10 @@ fn print_switch(output: SwitchOutput, json: bool) -> Result<(), AppError> {
             "Switched Codex to {} ({}) via {}.",
             output.provider.name, output.provider.id, output.backend
         );
-        for warning in output
-            .warnings
-            .iter()
-            .filter(|warning| !warning.starts_with("unverified_schema:"))
-        {
+        for warning in output.warnings.iter().filter(|warning| {
+            !warning.starts_with("unverified_schema:")
+                && !warning.starts_with("unverified_settings:")
+        }) {
             eprintln!("warning: {warning}");
         }
     } else {

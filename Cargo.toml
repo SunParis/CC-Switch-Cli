@@ -10,12 +10,13 @@ license = "MIT"
 cc-switch-schema16 = { package = "cc-switch", git = "https://github.com/farion1231/cc-switch.git", rev = "43eaf07355af145aebfee301801779e824d4c221" }
 cc-switch-schema17 = { package = "cc-switch", git = "https://github.com/farion1231/cc-switch.git", rev = "0b5da510168914b251481654a568c3ffacd62cf4" }
 cc-switch-schema18 = { package = "cc-switch", git = "https://github.com/farion1231/cc-switch.git", rev = "3217f72596f2d1c0f879f0a05f83803825d9809f" }
-cc-switch-schema20 = { package = "cc-switch", git = "https://github.com/farion1231/cc-switch.git", rev = "c261126630b3416e67b407da018cc614bbbe84cd" }
+cc-switch-schema20 = { package = "cc-switch", git = "https://github.com/farion1231/cc-switch.git", rev = "79e754ab1b6ed50da57dae1d0faecab4b3b52f1c" }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "5.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_ignored = "0.1"
 thiserror = "2.0"
 zbus = "=5.11.0"
 zbus_macros = "=5.11.0"

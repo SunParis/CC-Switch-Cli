@@ -11,6 +11,7 @@ use crate::state::StateReader;
 
 pub fn switch(reader: &StateReader, provider_id: &str) -> Result<Vec<String>, AppError> {
     let schema = reader.ensure_schema_unchanged()?;
+    reader.ensure_direct_settings_supported()?;
     let warnings = match schema.direct_generation() {
         DirectGeneration::V16 => switch_schema16(provider_id),
         DirectGeneration::V17 => switch_schema17(provider_id),
@@ -225,10 +226,39 @@ mod tests {
     }
 
     #[test]
-    fn schema20_switch_writes_live_config_preserves_schema_and_failover_setting() {
+    fn schema20_switch_preserves_latest_settings_schema_and_failover() {
         let _lock = TEST_HOME_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let _home = TestHome::set(temp.path());
+        let paths = Paths::for_home(temp.path().to_path_buf());
+        let mut settings = json!({
+            "currentProviderCodex": "one",
+            "quotaDisplay": "used",
+            "proxyClientHost": "proxy.example.invalid",
+            "codexStackClassicTools": false,
+            "codexStackSubagentModel": "ccs-test/model",
+            "codexStackSubagentReasoningEffort": "high",
+            "codexStackAutoReviewModel": "ccs-test/review",
+            "usageDisplay": {
+                "currency": "CNY",
+                "exchangeRates": {"CNY": 6.8},
+                "sidebarTodayItems": ["cost", "requests"],
+                "requestLogColumns": {"statusCode": true, "app": false},
+                "trendChartType": "area"
+            },
+            "localMigrations": {
+                "codexLegacyOfficialHistoryBucketV1": {
+                    "completedAt": "2026-10-19T00:00:00Z",
+                    "targetProviderId": "openai",
+                    "migratedJsonlFiles": 2,
+                    "migratedStateRows": 3,
+                    "codexConfigDir": temp.path().join(".codex")
+                }
+            }
+        });
+        std::fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
+        // Write before the upstream adapter initializes its process-wide settings cache.
+        std::fs::write(&paths.settings, format!("\u{feff}{settings}")).unwrap();
         let database = schema20::Database::init().unwrap();
         for (id, name, key) in [("one", "One", "test-one"), ("two", "Two", "test-two")] {
             let provider =
@@ -238,10 +268,18 @@ mod tests {
         database.set_current_provider("codex", "one").unwrap();
         database.set_proxy_flags_sync("codex", true, true).unwrap();
         drop(database);
-        let reader = StateReader::open(Paths::for_home(temp.path().to_path_buf())).unwrap();
+        let reader = StateReader::open(paths.clone()).unwrap();
+        assert!(reader.warnings().is_empty());
+        assert!(!reader.requires_installed_gui());
 
         switch(&reader, "two").unwrap();
 
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.settings).unwrap()).unwrap();
+        settings["currentProviderCodex"] = json!("two");
+        for (key, expected) in settings.as_object().unwrap() {
+            assert_eq!(&saved[key], expected, "setting was not preserved: {key}");
+        }
         assert!(reader.has_converged_to("two").unwrap());
         assert_eq!(
             reader.ensure_schema_unchanged().unwrap(),
@@ -256,6 +294,16 @@ mod tests {
             switch(&reader, "missing"),
             Err(AppError::Switch(_))
         ));
+        assert!(reader.has_converged_to("two").unwrap());
+
+        // Recheck before writes if a newer release changes settings after backend selection.
+        settings["futureSetting"] = json!(true);
+        let settings_bytes = serde_json::to_vec(&settings).unwrap();
+        std::fs::write(&paths.settings, &settings_bytes).unwrap();
+        let database_before = std::fs::read(&paths.database).unwrap();
+        assert!(matches!(switch(&reader, "one"), Err(AppError::State(_))));
+        assert_eq!(std::fs::read(&paths.settings).unwrap(), settings_bytes);
+        assert_eq!(std::fs::read(&paths.database).unwrap(), database_before);
         assert!(reader.has_converged_to("two").unwrap());
     }
 }

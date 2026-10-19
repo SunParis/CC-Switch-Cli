@@ -43,6 +43,7 @@ pub struct ProviderSummary {
 pub struct StateReader {
     paths: Paths,
     schema: SchemaVersion,
+    settings_supported: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -61,7 +62,12 @@ impl StateReader {
         }
         let connection = open_database(&paths.database)?;
         let schema = SchemaVersion::detect(&connection)?;
-        Ok(Self { paths, schema })
+        let settings_supported = settings_supported_by_adapter(&paths.settings, schema)?;
+        Ok(Self {
+            paths,
+            schema,
+            settings_supported,
+        })
     }
 
     #[cfg(test)]
@@ -70,11 +76,29 @@ impl StateReader {
     }
 
     pub fn warnings(&self) -> Vec<String> {
-        self.schema.warning().into_iter().collect()
+        let mut warnings: Vec<_> = self.schema.warning().into_iter().collect();
+        if !self.settings_supported {
+            warnings.push(
+                "unverified_settings: the bundled adapter cannot fully read CC Switch settings; \
+                 switching through the installed CC Switch GUI (started if needed) to preserve them"
+                    .into(),
+            );
+        }
+        warnings
     }
 
     pub fn requires_installed_gui(&self) -> bool {
-        self.schema.direct_generation() == crate::schema::DirectGeneration::InstalledGui
+        !self.settings_supported
+            || self.schema.direct_generation() == crate::schema::DirectGeneration::InstalledGui
+    }
+
+    pub(crate) fn ensure_direct_settings_supported(&self) -> Result<(), AppError> {
+        if !settings_supported_by_adapter(&self.paths.settings, self.schema)? {
+            return Err(AppError::State(
+                "settings require the installed CC Switch GUI; retry to select that backend".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn providers(&self) -> Result<Vec<ProviderSummary>, AppError> {
@@ -262,12 +286,29 @@ fn open_database(path: &Path) -> Result<Connection, AppError> {
     .map_err(state_error)
 }
 
+fn settings_supported_by_adapter(path: &Path, schema: SchemaVersion) -> Result<bool, AppError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(state_error(error)),
+    };
+    let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let value: Value =
+        serde_json::from_str(json).map_err(|_| AppError::State("invalid settings.json".into()))?;
+    if !value.is_object() {
+        return Err(AppError::State("invalid settings.json structure".into()));
+    }
+    Ok(schema.direct_generation().supports_settings(&text))
+}
+
 fn read_settings_current_id(path: &Path) -> Result<Option<String>, AppError> {
     if !path.exists() {
         return Ok(None);
     }
     let text = std::fs::read_to_string(path).map_err(state_error)?;
-    let value: Value = serde_json::from_str(&text).map_err(state_error)?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let value: Value =
+        serde_json::from_str(text).map_err(|_| AppError::State("invalid settings.json".into()))?;
     Ok(value
         .get("currentProviderCodex")
         .and_then(Value::as_str)
@@ -413,6 +454,76 @@ mod tests {
         assert_eq!(reader.current().unwrap().unwrap().id, "one");
         assert!(reader.warnings().is_empty());
         assert!(!reader.requires_installed_gui());
+    }
+
+    #[test]
+    fn unrecognized_settings_warn_and_require_gui_for_each_adapter() {
+        for schema in [
+            SchemaVersion::V16,
+            SchemaVersion::V17,
+            SchemaVersion::V18,
+            SchemaVersion::V20,
+        ] {
+            for extra in [
+                r#""futureSecret":"private-test-value""#,
+                r#""visibleApps":{"futureSecret":true}"#,
+                r#""showInTray":"private-test-value""#,
+            ] {
+                let (_temp, reader) = fixture(schema);
+                let settings = format!(r#"{{"currentProviderCodex":"one",{extra}}}"#);
+                std::fs::write(&reader.paths.settings, &settings).unwrap();
+                let reader = StateReader::open(reader.paths).unwrap();
+                assert!(reader.requires_installed_gui());
+                assert!(reader.has_converged_to("one").unwrap());
+                assert_eq!(reader.providers().unwrap().len(), 2);
+                let warnings = reader.warnings();
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].starts_with("unverified_settings:"));
+                assert!(!warnings[0].contains("futureSecret"));
+                assert!(!warnings[0].contains("private-test-value"));
+                assert_eq!(
+                    std::fs::read_to_string(&reader.paths.settings).unwrap(),
+                    settings
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bom_settings_are_readable_but_only_supported_by_latest_adapter() {
+        for schema in [
+            SchemaVersion::V16,
+            SchemaVersion::V17,
+            SchemaVersion::V18,
+            SchemaVersion::V20,
+        ] {
+            let (_temp, reader) = fixture(schema);
+            std::fs::write(
+                &reader.paths.settings,
+                "\u{feff}{\"currentProviderCodex\":\"one\"}",
+            )
+            .unwrap();
+            let reader = StateReader::open(reader.paths).unwrap();
+            assert!(reader.has_converged_to("one").unwrap());
+            assert_eq!(
+                reader.requires_installed_gui(),
+                schema != SchemaVersion::V20
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_settings_fail_without_disclosing_contents() {
+        for settings in [
+            r#"{"secret":"private-test-value",}"#,
+            r#"["private-test-value"]"#,
+        ] {
+            let (_temp, reader) = fixture(SchemaVersion::V20);
+            std::fs::write(&reader.paths.settings, settings).unwrap();
+            let error = StateReader::open(reader.paths).unwrap_err();
+            assert!(matches!(error, AppError::State(_)));
+            assert!(!error.to_string().contains("private-test-value"));
+        }
     }
 
     #[test]

@@ -32,6 +32,15 @@ impl Fixture {
             INSERT INTO providers VALUES ('two', 'Two', 'codex', 0, 2, NULL);",
         )
         .unwrap();
+        if schema == 20 {
+            db.execute_batch(
+                "CREATE TABLE session_usage_dedup (request_id TEXT);
+                 CREATE TABLE session_log_sync (last_byte_offset INTEGER, last_tail_fingerprint TEXT);
+                 CREATE TABLE mcp_servers (enabled_mcode BOOLEAN, enabled_pi BOOLEAN);
+                 CREATE TABLE skills (enabled_mcode BOOLEAN);",
+            )
+            .unwrap();
+        }
         db.pragma_update(None, "user_version", schema).unwrap();
         std::fs::write(
             app_dir.join("settings.json"),
@@ -68,6 +77,26 @@ impl Fixture {
             .env("PATH", self.home.path())
             .output()
             .unwrap()
+    }
+
+    fn add_future_settings(&self) -> Json {
+        let settings = serde_json::json!({
+            "currentProviderCodex": "one",
+            "localMigrations": {"futureSecret": "private-test-value"}
+        });
+        std::fs::write(
+            self.home.path().join(".cc-switch/settings.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        settings
+    }
+
+    fn settings(&self) -> Json {
+        serde_json::from_slice(
+            &std::fs::read(self.home.path().join(".cc-switch/settings.json")).unwrap(),
+        )
+        .unwrap()
     }
 
     fn serve(&self, fail: bool) -> zbus::blocking::Connection {
@@ -176,11 +205,11 @@ impl Menu {
             .unwrap()
             .execute("UPDATE providers SET is_current = (id = 'two')", [])
             .unwrap();
-        std::fs::write(
-            self.app_dir.join("settings.json"),
-            r#"{"currentProviderCodex":"two"}"#,
-        )
-        .unwrap();
+        let settings_path = self.app_dir.join("settings.json");
+        let mut settings: Json =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        settings["currentProviderCodex"] = Json::from("two");
+        std::fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
         *self.selected.lock().unwrap() = id;
         Ok(())
     }
@@ -246,4 +275,78 @@ fn unknown_schema_read_and_noop_work_without_gui() {
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("warning: unverified_schema:"));
     let output = fixture.run(&["codex", "--id", "missing"]);
     assert_eq!(output.status.code(), Some(4));
+}
+
+#[test]
+fn new_settings_on_known_schema_warn_and_switch_through_gui() {
+    let fixture = Fixture::new(20);
+    let mut expected = fixture.add_future_settings();
+    let _server = fixture.serve(false);
+    let output = fixture.run(&["--json", "codex", "--id", "two"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Json = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["backend"], "dbus");
+    assert_eq!(body["changed"], true);
+    assert_eq!(body["warnings"].as_array().unwrap().len(), 1);
+    let warning: Json = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(warning["warning"]["kind"], "unverified_settings");
+    for bytes in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains("futureSecret"));
+        assert!(!text.contains("private-test-value"));
+    }
+    expected["currentProviderCodex"] = Json::from("two");
+    assert_eq!(fixture.settings(), expected);
+}
+
+#[test]
+fn new_settings_read_and_noop_work_without_gui() {
+    let fixture = Fixture::new(20);
+    let expected = fixture.add_future_settings();
+    for args in [
+        vec!["--json", "codex", "--list"],
+        vec!["--json", "codex", "--current"],
+        vec!["--json", "codex", "--id", "one"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(output.status.success());
+        let body: Json = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["warnings"].as_array().unwrap().len(), 1);
+        let warning: Json = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(warning["warning"]["kind"], "unverified_settings");
+    }
+    let output = fixture.run(&["codex", "--name", "One"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("warning: unverified_settings:"));
+    assert_eq!(fixture.settings(), expected);
+}
+
+#[test]
+fn new_settings_gui_failure_is_an_error_without_direct_fallback() {
+    let fixture = Fixture::new(20);
+    let expected = fixture.add_future_settings();
+    let _server = fixture.serve(true);
+    let output = fixture.run(&["--json", "codex", "--id", "two"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let records: Vec<Json> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["warning"]["kind"], "unverified_settings");
+    assert_eq!(records[1]["error"]["kind"], "gui_error");
+    assert_eq!(fixture.settings(), expected);
+    let db = Connection::open(fixture.home.path().join(".cc-switch/cc-switch.db")).unwrap();
+    let current: String = db
+        .query_row("SELECT id FROM providers WHERE is_current = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(current, "one");
 }
