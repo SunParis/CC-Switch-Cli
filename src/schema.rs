@@ -22,41 +22,77 @@ const PROVIDERS_V1_COLUMNS: &[&str] = &[
     "created_at",
 ];
 
-const SCHEMA_17_REQUIREMENTS: &[LayoutRequirement] =
-    &[LayoutRequirement::Table("session_usage_dedup")];
-
-const SCHEMA_18_REQUIREMENTS: &[LayoutRequirement] = &[
-    LayoutRequirement::Table("session_usage_dedup"),
-    LayoutRequirement::TableColumns {
-        table: "session_log_sync",
-        columns: &["last_byte_offset", "last_tail_fingerprint"],
-    },
-];
-
-const SCHEMA_20_REQUIREMENTS: &[LayoutRequirement] = &[
-    LayoutRequirement::Table("session_usage_dedup"),
-    LayoutRequirement::TableColumns {
-        table: "session_log_sync",
-        columns: &["last_byte_offset", "last_tail_fingerprint"],
-    },
-    LayoutRequirement::TableColumns {
-        table: "mcp_servers",
-        columns: &["enabled_mcode", "enabled_pi"],
-    },
-    LayoutRequirement::TableColumns {
-        table: "skills",
-        columns: &["enabled_mcode"],
-    },
+// Only direct writers need these additional checks before upstream initialization.
+// GUI-backed profiles validate the provider layout they actually read.
+const DIRECT_REQUIREMENTS: &[(i32, LayoutRequirement)] = &[
+    (17, LayoutRequirement::Table("session_usage_dedup")),
+    (
+        18,
+        LayoutRequirement::TableColumns {
+            table: "session_log_sync",
+            columns: &["last_byte_offset", "last_tail_fingerprint"],
+        },
+    ),
+    (
+        19,
+        LayoutRequirement::TableColumns {
+            table: "mcp_servers",
+            columns: &["enabled_mcode"],
+        },
+    ),
+    (
+        19,
+        LayoutRequirement::TableColumns {
+            table: "skills",
+            columns: &["enabled_mcode"],
+        },
+    ),
+    (
+        20,
+        LayoutRequirement::TableColumns {
+            table: "mcp_servers",
+            columns: &["enabled_pi"],
+        },
+    ),
+    (
+        21,
+        LayoutRequirement::TableColumns {
+            table: "mcp_servers",
+            columns: &["enabled_agy"],
+        },
+    ),
+    (
+        21,
+        LayoutRequirement::TableColumns {
+            table: "skills",
+            columns: &["enabled_agy"],
+        },
+    ),
+    (
+        22,
+        LayoutRequirement::TableColumns {
+            table: "mcp_servers",
+            columns: &["enabled_kimi"],
+        },
+    ),
+    (
+        22,
+        LayoutRequirement::TableColumns {
+            table: "skills",
+            columns: &["enabled_kimi"],
+        },
+    ),
+    (
+        23,
+        LayoutRequirement::TableColumns {
+            table: "mcp_servers",
+            columns: &["enabled_omp"],
+        },
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SchemaVersion {
-    V16,
-    V17,
-    V18,
-    V20,
-    Unknown(i32),
-}
+pub struct SchemaVersion(i32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectGeneration {
@@ -64,6 +100,7 @@ pub enum DirectGeneration {
     V17,
     V18,
     V20,
+    V23,
     InstalledGui,
 }
 
@@ -76,6 +113,9 @@ impl DirectGeneration {
             Self::V17 => settings_are_understood::<cc_switch_schema17::AppSettings>(text),
             Self::V18 => settings_are_understood::<cc_switch_schema18::AppSettings>(text),
             Self::V20 => settings_are_understood::<cc_switch_schema20::AppSettings>(
+                text.strip_prefix('\u{feff}').unwrap_or(text),
+            ),
+            Self::V23 => settings_are_understood::<cc_switch_schema23::AppSettings>(
                 text.strip_prefix('\u{feff}').unwrap_or(text),
             ),
             Self::InstalledGui => true,
@@ -91,8 +131,10 @@ fn settings_are_understood<T: serde::de::DeserializeOwned>(text: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StateLayout {
-    ProvidersV1,
+enum CurrentState {
+    DatabaseOrLocal,
+    Local,
+    Live,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,126 +148,109 @@ enum LayoutRequirement {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CompatibilityProfile {
-    number: i32,
-    state_layout: StateLayout,
     direct_generation: DirectGeneration,
-    requirements: &'static [LayoutRequirement],
+    current_state: CurrentState,
 }
 
 impl SchemaVersion {
+    #[cfg(test)]
+    pub const fn new(number: i32) -> Self {
+        Self(number)
+    }
+
     pub fn detect(connection: &Connection) -> Result<Self, AppError> {
-        let found = read_schema_number(connection)?;
-        let schema = match found {
-            16 => Self::V16,
-            17 => Self::V17,
-            18 => Self::V18,
-            20 => Self::V20,
-            _ => Self::Unknown(found),
-        };
+        let schema = Self(read_schema_number(connection)?);
         schema.validate(connection)?;
         Ok(schema)
     }
 
     pub const fn number(self) -> i32 {
-        self.profile().number
+        self.0
     }
 
     pub const fn providers_query(self) -> &'static str {
-        self.state_layout().providers_query()
+        PROVIDERS_V1_QUERY
     }
 
     pub const fn current_provider_query(self) -> &'static str {
-        self.state_layout().current_provider_query()
+        CURRENT_PROVIDER_V1_QUERY
     }
 
     pub const fn direct_generation(self) -> DirectGeneration {
-        self.profile().direct_generation
+        match self.profile() {
+            Some(profile) => profile.direct_generation,
+            None => DirectGeneration::InstalledGui,
+        }
     }
 
     pub fn warning(self) -> Option<String> {
-        match self {
-            Self::Unknown(number) => Some(format!(
+        match self.profile() {
+            None => Some(format!(
                 "unverified_schema: CC Switch database schema {number} has not been validated; \
                  attempting compatible reads and switching through the installed CC Switch GUI \
-                 (started if needed)"
+                 (started if needed)",
+                number = self.0
             )),
             _ => None,
         }
     }
 
     pub const fn uses_live_state(self) -> bool {
-        matches!(self, Self::V20 | Self::Unknown(_))
+        matches!(self.current_state(), CurrentState::Live)
+    }
+
+    pub fn pointers_converged(
+        self,
+        database: Option<&str>,
+        local: Option<&str>,
+        target: &str,
+    ) -> bool {
+        database == Some(target)
+            && (local == Some(target)
+                || (local.is_none() && self.current_state() == CurrentState::DatabaseOrLocal))
+    }
+
+    const fn current_state(self) -> CurrentState {
+        match self.profile() {
+            Some(profile) => profile.current_state,
+            None => CurrentState::Live,
+        }
+    }
+
+    // Read layout is stable from schema 1 onward. Only state semantics and the
+    // writer vary; see docs/schema-support.md for the upstream history and limits.
+    const fn profile(self) -> Option<CompatibilityProfile> {
+        use CurrentState::{DatabaseOrLocal, Live, Local};
+        use DirectGeneration::{InstalledGui, V16, V17, V18, V20, V23};
+        let (direct_generation, current_state) = match self.0 {
+            1 => (InstalledGui, DatabaseOrLocal),
+            2..=15 => (InstalledGui, Local),
+            16 => (V16, Local),
+            17 => (V17, Local),
+            18 => (V18, Local),
+            19 => (InstalledGui, Live),
+            20 => (V20, Live),
+            21..=22 => (InstalledGui, Live),
+            23 => (V23, Live),
+            _ => return None,
+        };
+        Some(CompatibilityProfile {
+            direct_generation,
+            current_state,
+        })
     }
 
     pub fn validate(self, connection: &Connection) -> Result<(), AppError> {
-        let profile = self.profile();
-        profile.state_layout.validate(connection, self)?;
-        for requirement in profile.requirements {
-            requirement.validate(connection, self)?;
-        }
-        Ok(())
-    }
-
-    const fn state_layout(self) -> StateLayout {
-        self.profile().state_layout
-    }
-
-    const fn profile(self) -> CompatibilityProfile {
-        match self {
-            Self::V16 => CompatibilityProfile {
-                number: 16,
-                state_layout: StateLayout::ProvidersV1,
-                direct_generation: DirectGeneration::V16,
-                requirements: &[],
-            },
-            Self::V17 => CompatibilityProfile {
-                number: 17,
-                state_layout: StateLayout::ProvidersV1,
-                direct_generation: DirectGeneration::V17,
-                requirements: SCHEMA_17_REQUIREMENTS,
-            },
-            Self::V18 => CompatibilityProfile {
-                number: 18,
-                state_layout: StateLayout::ProvidersV1,
-                direct_generation: DirectGeneration::V18,
-                requirements: SCHEMA_18_REQUIREMENTS,
-            },
-            Self::V20 => CompatibilityProfile {
-                number: 20,
-                state_layout: StateLayout::ProvidersV1,
-                direct_generation: DirectGeneration::V20,
-                requirements: SCHEMA_20_REQUIREMENTS,
-            },
-            Self::Unknown(number) => CompatibilityProfile {
-                number,
-                state_layout: StateLayout::ProvidersV1,
-                direct_generation: DirectGeneration::InstalledGui,
-                requirements: &[],
-            },
-        }
-    }
-}
-
-impl StateLayout {
-    const fn providers_query(self) -> &'static str {
-        match self {
-            Self::ProvidersV1 => PROVIDERS_V1_QUERY,
-        }
-    }
-
-    const fn current_provider_query(self) -> &'static str {
-        match self {
-            Self::ProvidersV1 => CURRENT_PROVIDER_V1_QUERY,
-        }
-    }
-
-    fn validate(self, connection: &Connection, schema: SchemaVersion) -> Result<(), AppError> {
-        match self {
-            Self::ProvidersV1 => {
-                require_table(connection, schema, "providers")?;
-                require_columns(connection, schema, "providers", PROVIDERS_V1_COLUMNS)
+        require_table(connection, self, "providers")?;
+        require_columns(connection, self, "providers", PROVIDERS_V1_COLUMNS)?;
+        if self.direct_generation() != DirectGeneration::InstalledGui {
+            for (introduced, requirement) in DIRECT_REQUIREMENTS {
+                if *introduced <= self.0 {
+                    requirement.validate(connection, self)?;
+                }
             }
         }
+        Ok(())
     }
 }
 

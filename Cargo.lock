@@ -1104,6 +1104,86 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-switch"
+version = "4.0.21"
+source = "git+https://github.com/farion1231/cc-switch.git?rev=c4db63c60d2a1ddcb4bd9f81152b9c6126413659#c4db63c60d2a1ddcb4bd9f81152b9c6126413659"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-stream",
+ "auto-launch",
+ "axum",
+ "base64 0.22.1",
+ "brotli 7.0.0",
+ "bytes",
+ "chrono",
+ "dirs 5.0.1",
+ "flate2",
+ "futures",
+ "gtk",
+ "hmac",
+ "http",
+ "http-body",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "indexmap 2.14.0",
+ "json-five",
+ "json5",
+ "libc",
+ "log",
+ "objc2 0.5.2",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.2.2",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "once_cell",
+ "png 0.18.1",
+ "prost",
+ "regex",
+ "reqwest 0.12.28",
+ "rquickjs",
+ "rusqlite",
+ "rust_decimal",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sys-locale",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-deep-link",
+ "tauri-plugin-dialog",
+ "tauri-plugin-log",
+ "tauri-plugin-opener",
+ "tauri-plugin-process",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-store",
+ "tauri-plugin-updater",
+ "tauri-plugin-window-state",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "url",
+ "uuid",
+ "webkit2gtk",
+ "webpki-roots 0.26.11",
+ "windows-sys 0.61.2",
+ "winreg 0.52.0",
+ "zip 2.4.2",
+ "zstd",
+]
+
+[[package]]
 name = "cc-switch-cli"
 version = "0.1.0"
 dependencies = [
@@ -1111,6 +1191,7 @@ dependencies = [
  "cc-switch 3.20.0",
  "cc-switch 3.20.1",
  "cc-switch 4.0.15",
+ "cc-switch 4.0.21",
  "clap",
  "dirs 5.0.1",
  "rusqlite",
@@ -4363,6 +4444,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "ptr_meta"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6303,6 +6407,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

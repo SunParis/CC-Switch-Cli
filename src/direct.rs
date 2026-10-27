@@ -4,6 +4,7 @@ use cc_switch_schema16 as schema16;
 use cc_switch_schema17 as schema17;
 use cc_switch_schema18 as schema18;
 use cc_switch_schema20 as schema20;
+use cc_switch_schema23 as schema23;
 
 use crate::error::AppError;
 use crate::schema::DirectGeneration;
@@ -17,6 +18,7 @@ pub fn switch(reader: &StateReader, provider_id: &str) -> Result<Vec<String>, Ap
         DirectGeneration::V17 => switch_schema17(provider_id),
         DirectGeneration::V18 => switch_schema18(provider_id),
         DirectGeneration::V20 => switch_schema20(provider_id),
+        DirectGeneration::V23 => switch_schema23(provider_id),
         DirectGeneration::InstalledGui => Err(AppError::Switch(
             "this operation must be dispatched through the installed CC Switch GUI".into(),
         )),
@@ -81,6 +83,23 @@ fn switch_schema20(provider_id: &str) -> Result<Vec<String>, AppError> {
         ));
     }
     schema20::ProviderService::switch(&state, schema20::AppType::Codex, provider_id)
+        .map(|result| result.warnings)
+        .map_err(upstream_error)
+}
+
+fn switch_schema23(provider_id: &str) -> Result<Vec<String>, AppError> {
+    let database = Arc::new(schema23::Database::init().map_err(upstream_error)?);
+    let state = schema23::AppState::new(database);
+    if schema23::mode::current::is_proxy(&schema23::AppType::Codex)
+        && state.db.get_proxy_flags_sync("codex").1
+        && !schema23::mode::stack::stack_mode_now(&schema23::AppType::Codex)
+    {
+        return Err(AppError::Switch(
+            "Codex auto-failover is active; disable it in CC Switch before switching manually"
+                .into(),
+        ));
+    }
+    schema23::ProviderService::switch(&state, schema23::AppType::Codex, provider_id)
         .map(|result| result.warnings)
         .map_err(upstream_error)
 }
@@ -163,7 +182,7 @@ mod tests {
         assert!(reader.has_converged_to("two").unwrap());
         assert_eq!(
             reader.ensure_schema_unchanged().unwrap(),
-            SchemaVersion::V16
+            SchemaVersion::new(16)
         );
         let database = schema16::Database::init().unwrap();
         assert_eq!(database.get_proxy_flags_sync("codex"), (true, false));
@@ -191,7 +210,7 @@ mod tests {
         assert!(reader.has_converged_to("two").unwrap());
         assert_eq!(
             reader.ensure_schema_unchanged().unwrap(),
-            SchemaVersion::V17
+            SchemaVersion::new(17)
         );
         let database = schema17::Database::init().unwrap();
         assert_eq!(database.get_proxy_flags_sync("codex"), (true, false));
@@ -219,7 +238,7 @@ mod tests {
         assert!(reader.has_converged_to("two").unwrap());
         assert_eq!(
             reader.ensure_schema_unchanged().unwrap(),
-            SchemaVersion::V18
+            SchemaVersion::new(18)
         );
         let database = schema18::Database::init().unwrap();
         assert_eq!(database.get_proxy_flags_sync("codex"), (true, false));
@@ -283,7 +302,7 @@ mod tests {
         assert!(reader.has_converged_to("two").unwrap());
         assert_eq!(
             reader.ensure_schema_unchanged().unwrap(),
-            SchemaVersion::V20
+            SchemaVersion::new(20)
         );
         let config = std::fs::read_to_string(temp.path().join(".codex/config.toml")).unwrap();
         assert!(config.contains("experimental_bearer_token = \"test-two\""));
@@ -305,5 +324,86 @@ mod tests {
         assert_eq!(std::fs::read(&paths.settings).unwrap(), settings_bytes);
         assert_eq!(std::fs::read(&paths.database).unwrap(), database_before);
         assert!(reader.has_converged_to("two").unwrap());
+    }
+
+    #[test]
+    fn schema23_switch_preserves_latest_settings_and_schema() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = TestHome::set(temp.path());
+        let paths = Paths::for_home(temp.path().to_path_buf());
+        let settings: schema23::AppSettings = serde_json::from_value(json!({
+            "currentProviderCodex": "one",
+            "lightweightMode": true,
+            "nativeTrayMenu": true,
+            "appOrder": ["codex", "omp", "kimi", "agy"],
+            "ompConfigDir": temp.path().join("omp-test"),
+            "currentProviderAgy": "unrelated",
+            "visibleApps": {"codex": true, "omp": false, "kimi": true, "agy": false},
+            "quotaDisplay": "used",
+            "proxyClientHost": "proxy.example.invalid",
+            "codexStackSubagentModel": "ccs-test/model"
+        }))
+        .unwrap();
+        let mut expected = serde_json::to_value(settings).unwrap();
+        std::fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
+        std::fs::write(&paths.settings, serde_json::to_vec(&expected).unwrap()).unwrap();
+
+        let database = schema23::Database::init().unwrap();
+        for id in ["one", "two"] {
+            let provider =
+                schema23::Provider::with_id(id.into(), id.into(), provider_settings(id), None);
+            database.save_provider("codex", &provider).unwrap();
+        }
+        database.set_current_provider("codex", "one").unwrap();
+        database.set_proxy_flags_sync("codex", true, true).unwrap();
+        drop(database);
+        let reader = StateReader::open(paths.clone()).unwrap();
+        assert!(reader.warnings().is_empty());
+        assert!(!reader.requires_installed_gui());
+
+        switch(&reader, "two").unwrap();
+
+        expected["currentProviderCodex"] = json!("two");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.settings).unwrap()).unwrap();
+        assert_eq!(saved, expected);
+        assert!(reader.has_converged_to("two").unwrap());
+        assert_eq!(reader.ensure_schema_unchanged().unwrap().number(), 23);
+        assert!(
+            std::fs::read_to_string(temp.path().join(".codex/config.toml"))
+                .unwrap()
+                .contains("experimental_bearer_token = \"two\"")
+        );
+        let database = schema23::Database::init().unwrap();
+        assert_eq!(database.get_proxy_flags_sync("codex"), (true, true));
+        assert!(matches!(
+            switch(&reader, "missing"),
+            Err(AppError::Switch(_))
+        ));
+        assert!(reader.has_converged_to("two").unwrap());
+    }
+
+    #[test]
+    fn gui_backed_schemas_never_enter_a_bundled_writer_or_migrate() {
+        let _lock = TEST_HOME_LOCK.lock().unwrap();
+        for number in (1..=15).chain([19, 21, 22, 0, 24, 999]) {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = TestHome::set(temp.path());
+            let paths = Paths::for_home(temp.path().to_path_buf());
+            std::fs::create_dir_all(paths.database.parent().unwrap()).unwrap();
+            let db = rusqlite::Connection::open(&paths.database).unwrap();
+            crate::test_support::create_schema(&db, number);
+            drop(db);
+            let before = std::fs::read(&paths.database).unwrap();
+            let reader = StateReader::open(paths.clone()).unwrap();
+            assert!(
+                matches!(switch(&reader, "two"), Err(AppError::Switch(_))),
+                "schema {number}"
+            );
+            assert_eq!(std::fs::read(&paths.database).unwrap(), before);
+            assert!(!paths.settings.exists());
+            assert!(!temp.path().join(".codex").exists());
+        }
     }
 }

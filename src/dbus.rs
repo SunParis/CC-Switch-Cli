@@ -273,22 +273,7 @@ fn map_target_item<'a>(
     providers: &[ProviderSummary],
     provider_id: &str,
 ) -> Result<&'a MenuNode, AppError> {
-    let codex = root
-        .children
-        .iter()
-        .find(|node| {
-            node.label
-                .as_deref()
-                .is_some_and(|label| label == "Codex" || label.starts_with("Codex · "))
-        })
-        .ok_or_else(|| AppError::Gui("Codex submenu is not visible in the tray menu".into()))?;
-    // In 4.x, project checkboxes follow a separator in the same submenu.
-    let items = codex
-        .children
-        .iter()
-        .take_while(|node| !node.separator)
-        .filter(|node| node.toggle_state.is_some())
-        .collect::<Vec<_>>();
+    let items = codex_items(root, providers.len())?;
     let index = providers
         .iter()
         .position(|provider| provider.id == provider_id)
@@ -339,6 +324,50 @@ fn map_target_item<'a>(
     Err(AppError::Gui(
         "the target provider is unavailable or ambiguous in the CC Switch tray menu".into(),
     ))
+}
+
+fn codex_items(root: &MenuNode, provider_count: usize) -> Result<Vec<&MenuNode>, AppError> {
+    if let Some(codex) = root.children.iter().find(|node| {
+        !node.children.is_empty()
+            && node
+                .label
+                .as_deref()
+                .is_some_and(|label| label == "Codex" || label.starts_with("Codex · "))
+    }) {
+        // In 4.x, project checkboxes follow a separator in the same submenu.
+        return Ok(codex
+            .children
+            .iter()
+            .take_while(|node| !node.separator)
+            .filter(|node| node.toggle_state.is_some())
+            .collect());
+    }
+    // Older releases used disabled headings followed by flat checkbox rows.
+    // Stop at the next heading so another app's identically named provider cannot match.
+    let header = root
+        .children
+        .iter()
+        .position(|node| {
+            !node.enabled
+                && node.toggle_state.is_none()
+                && matches!(node.label.as_deref(), Some("─── Codex ───" | "Codex"))
+        })
+        .ok_or_else(|| AppError::Gui("Codex section is not visible in the tray menu".into()))?;
+    let mut items: Vec<_> = root.children[header + 1..]
+        .iter()
+        .take_while(|node| !node.separator && node.toggle_state.is_some())
+        .collect();
+    // Some schema-4/5 menus prepend an Auto checkbox. Require the extra row;
+    // a provider whose actual name is "Auto (Failover)" must remain selectable.
+    if items.len() == provider_count + 1
+        && matches!(
+            items[0].label.as_deref(),
+            Some("Auto (Failover)" | "自動 (フェイルオーバー)" | "自动 (故障转移)")
+        )
+    {
+        items.remove(0);
+    }
+    Ok(items)
 }
 
 fn tray_name(name: &str) -> String {
@@ -456,6 +485,59 @@ mod tests {
         };
 
         assert_eq!(map_target_item(&root, &providers, "second").unwrap().id, 11);
+    }
+
+    #[test]
+    fn flat_menu_scopes_duplicates_and_auto_named_providers_to_codex() {
+        for heading in ["─── Codex ───", "Codex"] {
+            for auto in [
+                None,
+                Some("Auto (Failover)"),
+                Some("自動 (フェイルオーバー)"),
+                Some("自动 (故障转移)"),
+            ] {
+                let providers = vec![
+                    provider("first", "Auto (Failover)"),
+                    provider("second", "Auto (Failover)"),
+                ];
+                let mut root = node(0, "", None);
+                let mut header = node(1, heading, None);
+                header.enabled = false;
+                let mut next = node(2, "Gemini", None);
+                next.enabled = false;
+                root.children = vec![node(98, "Auto (Failover)", Some(1)), header];
+                if let Some(label) = auto {
+                    root.children.push(node(9, label, Some(0)));
+                }
+                root.children.extend([
+                    node(10, "Auto (Failover)", Some(1)),
+                    node(11, "Auto (Failover)", Some(0)),
+                    next,
+                    node(99, "Auto (Failover)", Some(1)),
+                ]);
+                assert_eq!(map_target_item(&root, &providers, "second").unwrap().id, 11);
+            }
+        }
+    }
+
+    #[test]
+    fn flat_menu_does_not_match_a_provider_from_the_next_app() {
+        let providers = vec![provider("one", "One"), provider("two", "Two")];
+        let mut root = node(0, "", None);
+        let mut codex = node(1, "Codex", None);
+        codex.enabled = false;
+        let mut next = node(2, "Gemini", None);
+        next.enabled = false;
+        root.children = vec![
+            codex,
+            node(10, "One", Some(1)),
+            next,
+            node(99, "Two", Some(1)),
+        ];
+        assert!(matches!(
+            map_target_item(&root, &providers, "two"),
+            Err(AppError::Gui(_))
+        ));
     }
 
     #[test]

@@ -6,6 +6,10 @@ mod process;
 mod schema;
 mod state;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 use clap::Parser;
 use cli::{Cli, Command};
 use error::{AppError, ErrorOutput};

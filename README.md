@@ -11,9 +11,16 @@ cc-switch-cli codex --name 'XXX'
 ## Compatibility
 
 - Linux
-- Validated against CC Switch `3.19.2`, `3.20.0`, `3.20.1`, and `4.0.15`
-- Reviewed SQLite schemas: `16`, `17`, `18`, and `20`
+- Source-reviewed SQLite schemas: **`1` through `23`**, with fixtures for every schema
+- Latest reviewed upstream release: CC Switch **`4.0.21`** (schema `23`)
 - Codex providers
+
+All reviewed schemas support listing, current-provider reads, no-op selection, and switching
+through the installed CC Switch GUI. Direct switching with the GUI closed is available for schemas
+`16`, `17`, `18`, `20`, and `23`; the other reviewed schemas start the installed GUI if needed.
+Historical GUI support assumes the installed CC Switch can open that database and exposes its
+Linux tray interface. See the [support matrix and source history](docs/schema-support.md) for the
+scope of verification and the differences between generations.
 
 The CLI does not inspect or reject the installed CC Switch package version. Instead, it selects an
 explicit compatibility profile from SQLite `PRAGMA user_version` and validates the tables and
@@ -24,17 +31,18 @@ errors and nonzero exit codes. An unrecognized package release that uses a revie
 produce a version warning, because the package version is not inspected.
 
 Settings compatibility is checked separately: a release can add settings without changing its
-SQLite schema. CC Switch `4.0.15` still uses schema `20`; its adapter preserves the newer quota,
-proxy client host, usage display, Codex stack, and local migration settings. If the selected adapter
-would ignore a settings field (including a nested field), or cannot deserialize its value, the CLI
+SQLite schema. The schema-20 adapter preserves CC Switch `4.0.15` settings, and the schema-23
+adapter preserves `4.0.21` settings, including lightweight mode, app order, and newer app visibility
+and directory options. If the selected adapter would ignore a settings field (including a nested
+field), or cannot deserialize its value, the CLI
 emits an `unverified_settings` warning and delegates switching to the installed GUI. It does not let
 the older bundled writer discard these fields. Malformed JSON remains a state-read error; warnings
 never include settings field names or values.
 
-On an unknown schema (including `19`), or with settings the adapter cannot fully read, listing,
+On a schema without a bundled direct adapter, or with settings the adapter cannot fully read, listing,
 current-provider reads, and no-op switches work without the GUI when the stored state is readable.
-A switch to another provider uses the installed
-CC Switch tray interface. If CC Switch is closed, the CLI starts `cc-switch` from `PATH`, waits up to
+A switch to another provider uses the installed CC Switch tray interface. If CC Switch is closed,
+the CLI starts `cc-switch` from `PATH`, waits up to
 10 seconds for its tray interface, and leaves it running. This path requires a graphical session
 with a session D-Bus and StatusNotifier watcher. The CLI does not pass an unknown database to an
 older bundled adapter, change its schema number, or migrate it itself. Startup and tray failures
@@ -61,7 +69,7 @@ cc-switch-cli --json codex --name 'XXX'
 
 Selecting the provider that is already active succeeds without writing any files. Schemas 16–18
 retain the legacy behavior: explicit switching preserves proxy-enabled state and disables
-auto-failover. The 4.0.15 adapter preserves both settings, matching the current tray behavior.
+auto-failover. The 4.x adapters preserve both settings, matching the current tray behavior.
 When auto-failover is active in routing mode, manual provider selection is disabled; turn it off in
 CC Switch first. Aggregation follows the provider choices exposed by CC Switch.
 
@@ -85,6 +93,7 @@ the settings, the profile selects the matching upstream
 - Schema `17`: CC Switch `3.20.0`, commit `0b5da510168914b251481654a568c3ffacd62cf4`
 - Schema `18`: CC Switch `3.20.1`, commit `3217f72596f2d1c0f879f0a05f83803825d9809f`
 - Schema `20`: CC Switch `4.0.15`, commit `79e754ab1b6ed50da57dae1d0faecab4b3b52f1c`
+- Schema `23`: CC Switch `4.0.21`, commit `c4db63c60d2a1ddcb4bd9f81152b9c6126413659`
 
 Keeping separate direct adapters prevents a newer implementation from silently migrating an older
 supported database. The CLI verifies `PRAGMA user_version` immediately before and after a direct
@@ -96,14 +105,16 @@ instead of falling back to direct writes.
 Each switch waits up to 10 seconds for the relevant state to converge:
 
 - In direct mode, SQLite `providers.is_current` and `currentProviderCodex` in
-  `~/.cc-switch/settings.json` must both identify the target.
+  `~/.cc-switch/settings.json` must both identify the target. Early schema-1 releases did not
+  store a local pointer; for schema `1` only, its absence permits SQLite-only convergence.
 - In 4.x proxy mode, `apps.codex.proxy_route` in `~/.cc-switch/live-state.json` must identify
   an existing target provider. The direct provider remains independent. An unfinished `pending`
   operation prevents success.
 - The target tray item's `toggle-state` when the GUI is running
 
-Tray matching handles legacy menus and 4.0.15's truncated names, duplicate-name suffixes, filtered
-provider lists, and project sections. A disabled, unavailable, or ambiguously identified provider
+Tray matching handles flat sections with decorated or plain headings, the historical Auto/Failover
+row, application submenus, and 4.x truncated names, duplicate-name suffixes, filtered provider lists,
+and project sections. A disabled, unavailable, or ambiguously identified provider
 returns a GUI error.
 
 Output is limited to provider names, UUIDs, the selected backend, and non-sensitive warning codes.
@@ -111,15 +122,12 @@ Credentials, URLs, and provider configuration are never printed.
 
 ## Extending Schema Support
 
-Schema compatibility is centralized in `src/schema.rs`. Each supported schema explicitly selects a
-normalized provider-table layout, validates its required database shape, and maps to a reviewed
-direct-switch adapter. Reviewed schemas share the provider-table layout while using different
-direct adapters. Schema `17` additionally requires its persistent session-usage
-deduplication table. Schema `18` also requires the byte cursor and tail fingerprint columns added to
-`session_log_sync` by the 17-to-18 migration. Schema `20` also checks `enabled_mcode` in `mcp_servers`
-and `skills`, and `enabled_pi` in `mcp_servers`. Its current-provider reads account for device-local
-proxy state. Unknown schemas use these current-state conventions when present and select the
-installed GUI for writes.
+Schema compatibility is centralized in `src/schema.rs`. A profile selects current-state semantics
+and a writer independently. All reviewed schemas share the provider read layout. GUI-backed
+profiles validate only the columns they read; direct profiles also validate cumulative structural
+requirements before invoking upstream initialization. Schemas `19` onward account for device-local proxy
+state when present. Unknown schemas attempt these current-state conventions and select the GUI
+for writes, with an `unverified_schema` warning.
 
 Each direct generation also checks settings using its own upstream `AppSettings` deserializer,
 tracking ignored fields at every nesting level. This keeps the accepted settings format tied to
@@ -130,16 +138,18 @@ left over from earlier releases; the installed GUI handles its own settings migr
 Supporting a future schema or refreshing an adapter for a newer release requires:
 
 1. Reviewing upstream migrations, settings, current-provider semantics, and tray behavior, even
-   when `user_version` has not changed. Add a `SchemaVersion` profile and required shape checks
+   when `user_version` has not changed. Add a compatibility profile and required shape checks
    when the database schema changes.
 2. Reusing an existing read layout or adding new normalized queries when provider storage changes.
-3. Pinning a matching upstream direct adapter that does not migrate another supported schema.
+3. Selecting GUI switching, or pinning a matching upstream direct adapter that does not migrate
+   another supported schema. Read support does not require a bundled writer for every version.
 4. Adding read and direct-switch fixtures that assert `user_version` remains unchanged and newer
    settings survive a switch. Cover GUI fallback for unknown settings and nonzero errors when
    an operation fails.
 
 Future schema numbers enter the warning-based fallback automatically. Reviewing a schema adds a
-verified profile and direct adapter; it is not necessary just to attempt reads or GUI switching.
+verified profile and, optionally, a direct adapter; it is not necessary just to attempt reads or
+GUI switching.
 
 ## Build and Install
 

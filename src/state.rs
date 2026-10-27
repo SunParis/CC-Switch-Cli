@@ -185,8 +185,11 @@ impl StateReader {
         }
         let db_current = self.db_current_id()?;
         let file_current = self.settings_current_id()?;
-        Ok(db_current.as_deref() == Some(provider_id)
-            && file_current.as_deref() == Some(provider_id))
+        Ok(self.schema.pointers_converged(
+            db_current.as_deref(),
+            file_current.as_deref(),
+            provider_id,
+        ))
     }
 
     pub(crate) fn ensure_schema_unchanged(&self) -> Result<SchemaVersion, AppError> {
@@ -331,60 +334,7 @@ mod tests {
         let paths = Paths::for_home(temp.path().to_path_buf());
         std::fs::create_dir_all(paths.database.parent().unwrap()).unwrap();
         let connection = Connection::open(&paths.database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE providers (
-                    id TEXT NOT NULL,
-                    app_type TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    is_current BOOLEAN NOT NULL DEFAULT 0,
-                    created_at INTEGER,
-                    sort_index INTEGER,
-                    PRIMARY KEY (id, app_type)
-                 );",
-            )
-            .unwrap();
-        if matches!(
-            schema,
-            SchemaVersion::V17 | SchemaVersion::V18 | SchemaVersion::V20
-        ) {
-            connection
-                .execute_batch(
-                    "CREATE TABLE session_usage_dedup (
-                        data_source TEXT NOT NULL,
-                        request_id TEXT NOT NULL,
-                        semantic_id TEXT NOT NULL,
-                        has_entry_id INTEGER NOT NULL DEFAULT 0,
-                        PRIMARY KEY (data_source, request_id)
-                     );
-                     CREATE TABLE session_log_sync (
-                        file_path TEXT PRIMARY KEY,
-                        last_modified INTEGER NOT NULL,
-                        last_line_offset INTEGER NOT NULL DEFAULT 0,
-                        last_synced_at INTEGER NOT NULL
-                     );",
-                )
-                .unwrap();
-        }
-        if matches!(schema, SchemaVersion::V18 | SchemaVersion::V20) {
-            connection
-                .execute_batch(
-                    "ALTER TABLE session_log_sync ADD COLUMN last_byte_offset INTEGER;
-                     ALTER TABLE session_log_sync ADD COLUMN last_tail_fingerprint INTEGER;",
-                )
-                .unwrap();
-        }
-        if schema == SchemaVersion::V20 {
-            connection
-                .execute_batch(
-                    "CREATE TABLE mcp_servers (enabled_mcode BOOLEAN, enabled_pi BOOLEAN);
-                 CREATE TABLE skills (enabled_mcode BOOLEAN);",
-                )
-                .unwrap();
-        }
-        connection
-            .pragma_update(None, "user_version", schema.number())
-            .unwrap();
+        crate::test_support::create_schema(&connection, schema.number());
         connection
             .execute(
                 "INSERT INTO providers (id, app_type, name, is_current, sort_index)
@@ -406,7 +356,7 @@ mod tests {
 
     #[test]
     fn settings_current_takes_precedence_over_database() {
-        let (_temp, reader) = fixture(SchemaVersion::V16);
+        let (_temp, reader) = fixture(SchemaVersion::new(16));
         std::fs::write(
             &reader.paths().settings,
             r#"{"currentProviderCodex":"two"}"#,
@@ -417,7 +367,7 @@ mod tests {
 
     #[test]
     fn name_matching_is_exact_and_case_sensitive() {
-        let (_temp, reader) = fixture(SchemaVersion::V16);
+        let (_temp, reader) = fixture(SchemaVersion::new(16));
         assert_eq!(reader.by_name("Provider One").unwrap().id, "one");
         assert!(matches!(
             reader.by_name("provider one"),
@@ -427,20 +377,20 @@ mod tests {
 
     #[test]
     fn schema17_profile_reads_providers() {
-        let (_temp, reader) = fixture(SchemaVersion::V17);
+        let (_temp, reader) = fixture(SchemaVersion::new(17));
         assert_eq!(reader.providers().unwrap().len(), 2);
     }
 
     #[test]
     fn schema18_profile_reads_providers() {
-        let (_temp, reader) = fixture(SchemaVersion::V18);
+        let (_temp, reader) = fixture(SchemaVersion::new(18));
         assert_eq!(reader.providers().unwrap().len(), 2);
     }
 
     #[test]
     fn unknown_schemas_warn_and_read_without_migration() {
-        for number in [0, 15, 19, 21, 999] {
-            let (_temp, reader) = fixture(SchemaVersion::Unknown(number));
+        for number in [0, 24, 999] {
+            let (_temp, reader) = fixture(SchemaVersion::new(number));
             assert_eq!(reader.providers().unwrap().len(), 2);
             assert_eq!(reader.warnings().len(), 1);
             assert!(reader.requires_installed_gui());
@@ -450,7 +400,7 @@ mod tests {
 
     #[test]
     fn schema20_reads_without_warning() {
-        let (_temp, reader) = fixture(SchemaVersion::V20);
+        let (_temp, reader) = fixture(SchemaVersion::new(20));
         assert_eq!(reader.current().unwrap().unwrap().id, "one");
         assert!(reader.warnings().is_empty());
         assert!(!reader.requires_installed_gui());
@@ -459,10 +409,11 @@ mod tests {
     #[test]
     fn unrecognized_settings_warn_and_require_gui_for_each_adapter() {
         for schema in [
-            SchemaVersion::V16,
-            SchemaVersion::V17,
-            SchemaVersion::V18,
-            SchemaVersion::V20,
+            SchemaVersion::new(16),
+            SchemaVersion::new(17),
+            SchemaVersion::new(18),
+            SchemaVersion::new(20),
+            SchemaVersion::new(23),
         ] {
             for extra in [
                 r#""futureSecret":"private-test-value""#,
@@ -492,10 +443,11 @@ mod tests {
     #[test]
     fn bom_settings_are_readable_but_only_supported_by_latest_adapter() {
         for schema in [
-            SchemaVersion::V16,
-            SchemaVersion::V17,
-            SchemaVersion::V18,
-            SchemaVersion::V20,
+            SchemaVersion::new(16),
+            SchemaVersion::new(17),
+            SchemaVersion::new(18),
+            SchemaVersion::new(20),
+            SchemaVersion::new(23),
         ] {
             let (_temp, reader) = fixture(schema);
             std::fs::write(
@@ -505,10 +457,7 @@ mod tests {
             .unwrap();
             let reader = StateReader::open(reader.paths).unwrap();
             assert!(reader.has_converged_to("one").unwrap());
-            assert_eq!(
-                reader.requires_installed_gui(),
-                schema != SchemaVersion::V20
-            );
+            assert_eq!(reader.requires_installed_gui(), schema.number() < 20);
         }
     }
 
@@ -518,7 +467,7 @@ mod tests {
             r#"{"secret":"private-test-value",}"#,
             r#"["private-test-value"]"#,
         ] {
-            let (_temp, reader) = fixture(SchemaVersion::V20);
+            let (_temp, reader) = fixture(SchemaVersion::new(20));
             std::fs::write(&reader.paths.settings, settings).unwrap();
             let error = StateReader::open(reader.paths).unwrap_err();
             assert!(matches!(error, AppError::State(_)));
@@ -528,7 +477,7 @@ mod tests {
 
     #[test]
     fn tied_sort_indices_preserve_upstream_database_order() {
-        let (_temp, reader) = fixture(SchemaVersion::V20);
+        let (_temp, reader) = fixture(SchemaVersion::new(20));
         Connection::open(&reader.paths.database)
             .unwrap()
             .execute_batch(
@@ -548,7 +497,7 @@ mod tests {
 
     #[test]
     fn proxy_route_takes_precedence_and_converges_without_changing_direct_pointer() {
-        for schema in [SchemaVersion::V20, SchemaVersion::Unknown(21)] {
+        for schema in [19, 20, 21, 22, 23, 24].map(SchemaVersion::new) {
             let (_temp, reader) = fixture(schema);
             std::fs::write(&reader.paths.settings, r#"{"currentProviderCodex":"one"}"#).unwrap();
             std::fs::write(
@@ -564,7 +513,7 @@ mod tests {
 
     #[test]
     fn direct_mode_ignores_saved_proxy_route() {
-        let (_temp, reader) = fixture(SchemaVersion::V20);
+        let (_temp, reader) = fixture(SchemaVersion::new(20));
         std::fs::write(&reader.paths.settings, r#"{"currentProviderCodex":"one"}"#).unwrap();
         std::fs::write(
             &reader.paths.live_state,
@@ -577,7 +526,7 @@ mod tests {
 
     #[test]
     fn pending_switch_does_not_report_success() {
-        let (_temp, reader) = fixture(SchemaVersion::V20);
+        let (_temp, reader) = fixture(SchemaVersion::new(20));
         std::fs::write(
             &reader.paths.live_state,
             r#"{"apps":{"codex":{"mode":"proxy","proxy_route":"two","pending":{}}}}"#,
@@ -588,14 +537,14 @@ mod tests {
 
     #[test]
     fn malformed_live_state_still_errors() {
-        let (_temp, reader) = fixture(SchemaVersion::Unknown(21));
+        let (_temp, reader) = fixture(SchemaVersion::new(24));
         std::fs::write(&reader.paths.live_state, "invalid").unwrap();
         assert!(matches!(reader.current(), Err(AppError::State(_))));
     }
 
     #[test]
     fn unknown_schema_with_unreadable_provider_layout_still_errors() {
-        let (_temp, reader) = fixture(SchemaVersion::Unknown(21));
+        let (_temp, reader) = fixture(SchemaVersion::new(24));
         Connection::open(&reader.paths.database)
             .unwrap()
             .execute_batch("ALTER TABLE providers DROP COLUMN name;")
@@ -605,7 +554,7 @@ mod tests {
 
     #[test]
     fn schema20_requires_pi_mcp_column() {
-        let (_temp, reader) = fixture(SchemaVersion::V20);
+        let (_temp, reader) = fixture(SchemaVersion::new(20));
         Connection::open(&reader.paths.database)
             .unwrap()
             .execute_batch("ALTER TABLE mcp_servers DROP COLUMN enabled_pi;")
@@ -618,7 +567,7 @@ mod tests {
 
     #[test]
     fn rejects_schema17_without_required_layout() {
-        let (temp, _reader) = fixture(SchemaVersion::V16);
+        let (temp, _reader) = fixture(SchemaVersion::new(16));
         let paths = Paths::for_home(temp.path().to_path_buf());
         let connection = Connection::open(&paths.database).unwrap();
         connection.pragma_update(None, "user_version", 17).unwrap();
@@ -631,7 +580,7 @@ mod tests {
 
     #[test]
     fn rejects_schema18_without_byte_cursor_layout() {
-        let (temp, _reader) = fixture(SchemaVersion::V17);
+        let (temp, _reader) = fixture(SchemaVersion::new(17));
         let paths = Paths::for_home(temp.path().to_path_buf());
         let connection = Connection::open(&paths.database).unwrap();
         connection.pragma_update(None, "user_version", 18).unwrap();
@@ -644,7 +593,7 @@ mod tests {
 
     #[test]
     fn detects_schema_change_after_open() {
-        let (_temp, reader) = fixture(SchemaVersion::V16);
+        let (_temp, reader) = fixture(SchemaVersion::new(16));
         let connection = Connection::open(&reader.paths().database).unwrap();
         connection.pragma_update(None, "user_version", 17).unwrap();
         drop(connection);
@@ -655,5 +604,66 @@ mod tests {
                 found: 17
             })
         ));
+    }
+
+    #[test]
+    fn all_reviewed_schemas_read_without_migration_or_version_warning() {
+        for number in 1..=23 {
+            let (_temp, reader) = fixture(SchemaVersion::new(number));
+            let before = std::fs::read(&reader.paths.database).unwrap();
+            assert!(reader.warnings().is_empty(), "schema {number}");
+            assert_eq!(reader.providers().unwrap().len(), 2);
+            assert_eq!(reader.current().unwrap().unwrap().id, "one");
+            assert_eq!(
+                reader.requires_installed_gui(),
+                !matches!(number, 16..=18 | 20 | 23)
+            );
+            assert_eq!(std::fs::read(&reader.paths.database).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn only_early_schema1_can_converge_without_a_local_pointer() {
+        for number in 1..=23 {
+            let (_temp, reader) = fixture(SchemaVersion::new(number));
+            assert_eq!(reader.has_converged_to("one").unwrap(), number == 1);
+            std::fs::write(&reader.paths.settings, r#"{"currentProviderCodex":"two"}"#).unwrap();
+            assert!(!reader.has_converged_to("one").unwrap());
+            assert!(!reader.has_converged_to("two").unwrap());
+        }
+    }
+
+    #[test]
+    fn legacy_schemas_ignore_leftover_modern_live_state() {
+        for number in 1..=18 {
+            let (_temp, reader) = fixture(SchemaVersion::new(number));
+            std::fs::write(
+                &reader.paths.live_state,
+                r#"{"apps":{"codex":{"mode":"proxy","proxy_route":"two"}}}"#,
+            )
+            .unwrap();
+            assert_eq!(reader.current().unwrap().unwrap().id, "one");
+        }
+    }
+
+    #[test]
+    fn schema23_requires_all_new_adapter_columns() {
+        for (table, column) in [
+            ("mcp_servers", "enabled_agy"),
+            ("skills", "enabled_agy"),
+            ("mcp_servers", "enabled_kimi"),
+            ("skills", "enabled_kimi"),
+            ("mcp_servers", "enabled_omp"),
+        ] {
+            let (_temp, reader) = fixture(SchemaVersion::new(23));
+            Connection::open(&reader.paths.database)
+                .unwrap()
+                .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                .unwrap();
+            assert!(matches!(
+                StateReader::open(reader.paths),
+                Err(AppError::IncompatibleSchemaLayout { schema: 23, .. })
+            ));
+        }
     }
 }
